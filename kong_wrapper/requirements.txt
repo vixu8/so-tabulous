@@ -1,0 +1,14 @@
+# Runtime dependencies for original Kong source + this wrapper.
+# Install the correct CUDA-enabled PyTorch build separately if applicable.
+torch>=2.2
+torchlibrosa>=0.1.0
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7
+librosa>=0.10
+# Needed because Kong's models.py imports its legacy pytorch_utils -> utilities:
+h5py>=3.8
+pandas>=1.5
+mido>=1.2
+soundfile>=0.12
+audioread>=3.0
