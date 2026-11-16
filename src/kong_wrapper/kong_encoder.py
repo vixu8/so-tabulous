@@ -73,7 +73,7 @@ def _make_upstream_note_model(repo_path: str | Path) -> nn.Module:
     except ModuleNotFoundError as exc:
         raise ImportError(
             f"Missing dependency {exc.name!r} while importing the Kong repo. "
-            "Install requirements.txt from this wrapper, and check that "
+            "Install requirements/model.txt (repo root), and check that "
             "the original repo exists at repo_path."
         ) from exc
     return module.Regress_onset_offset_frame_velocity_CRNN(

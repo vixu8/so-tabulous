@@ -38,14 +38,14 @@ The adapter **adds** a guitar-specific correction; it never replaces Kong's orig
 | `fusion_adapter.py` | Optional residual fusion adapter |
 | `tests/test_kong_wrapper.py` | Fast unit tests (mock backbone) |
 | `scripts/smoke_test_checkpoint.py` | Integration test with real Kong weights |
-| `requirements.txt`, `requirements-dev.txt` | Dependencies |
+| `../../requirements/model.txt`, `../../requirements/dev.txt` | Dependencies (in `requirements/` at the repo root) |
 
 ## Setup
 
 Run from this package's directory (Python 3.10+ recommended). For GPU use, install the appropriate [PyTorch build](https://pytorch.org/get-started/locally/) first.
 
 ```bash
-python -m pip install -r requirements-dev.txt
+python -m pip install -r ../../requirements/dev.txt
 mkdir -p third_party checkpoints
 
 git clone --depth 1 https://github.com/bytedance/piano_transcription.git \

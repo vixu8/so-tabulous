@@ -1,1 +1,16 @@
-features
+# Preprocessing output, Kong weights and Kong source (setup: src/kong_wrapper/README.md)
+features/
+checkpoints/
+third_party/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+build/
+dist/
+
+# OS / editor
+.DS_Store

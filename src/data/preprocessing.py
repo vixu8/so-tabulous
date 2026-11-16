@@ -24,8 +24,8 @@ HDF5 contents (Kong-compatible fields + tab additions):
 Velocity is a placeholder (GuitarSet has none): mask the velocity loss in training.
 
 Usage:
-  python preprocessing.py --val_player 04 --test_player 05
-  python preprocessing.py --val_player 04 --test_player 05 --skip_download
+  python src/data/preprocessing.py --val_player 04 --test_player 05
+  python src/data/preprocessing.py --val_player 04 --test_player 05 --skip_download
 """
 
 # To open one clip:

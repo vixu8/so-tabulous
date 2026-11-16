@@ -1,0 +1,3 @@
+-r data.txt
+-r model.txt
+pytest>=7.0
