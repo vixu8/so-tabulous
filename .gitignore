@@ -3,6 +3,10 @@ features/
 checkpoints/
 third_party/
 
+# tabcnn, speciifcally the old python 2 versions and the processed dataset
+src/tabcnn/model/
+src/tabcnn/data/
+
 # Python
 __pycache__/
 *.py[cod]
