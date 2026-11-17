@@ -20,7 +20,7 @@ def note(string, fret, onset, offset):
     return [string, fret, onset, offset]
 
 
-def random_on_grid_notes(rng, n, window_s=4.0, start_s=0.0):
+def random_on_grid_notes(rng, n, window_s=10.0, start_s=0.0):
     """Random notes with onsets on the 10 ms grid and unique (onset, string)."""
     onset_frames = rng.integers(0, int(window_s * FPS), size=n)
     strings = rng.integers(0, 6, size=n)
@@ -36,15 +36,23 @@ def random_on_grid_notes(rng, n, window_s=4.0, start_s=0.0):
 
 # ----- vocabulary -----
 
-def test_vocab_layout(tok):
-    assert tok.n_onset_frames == 400
-    assert tok.vocab_size == 3 + 400 + tok.n_duration_tokens + 6 + 20
-    sizes = {ONSET: 400, DUR: tok.n_duration_tokens, STRING: 6, FRET: 20}
+def test_default_vocab(tok):
+    assert tok.segment_seconds == 10.0 and tok.n_onset_frames == 1000
+    assert tok.n_duration_tokens == 75 and tok.vocab_size == 1104
+
+
+@pytest.mark.parametrize("seconds", [2.0, 4.0, 10.0])
+def test_vocab_layout(seconds):
+    tok = TabTokenizer(segment_seconds=seconds)
+    n_onset = int(seconds * FPS)
+    assert tok.n_onset_frames == n_onset
+    assert tok.vocab_size == 3 + n_onset + tok.n_duration_tokens + 6 + 20
+    sizes = {ONSET: n_onset, DUR: tok.n_duration_tokens, STRING: 6, FRET: 20}
     types = tok.token_types(np.arange(tok.vocab_size))
     for t, size in sizes.items():
         idx = np.flatnonzero(types == t)
         assert len(idx) == size and np.all(np.diff(idx) == 1)  # one contiguous range each
-    assert tok.duration_frames[0] == 1 and tok.duration_frames[-1] == 400
+    assert tok.duration_frames[0] == 1 and tok.duration_frames[-1] == n_onset
     assert np.all(np.diff(tok.duration_frames) > 0)
 
 
@@ -64,7 +72,7 @@ def test_config_round_trip():
 
 def test_round_trip_random(tok):
     rng = np.random.default_rng(0)
-    for start in [0.0, 8.0]:
+    for start in [0.0, 20.0]:
         notes = random_on_grid_notes(rng, 60, start_s=start)
         out = tok.decode(tok.encode(notes, start_s=start), start_s=start)
         assert out.shape == notes.shape
@@ -72,11 +80,11 @@ def test_round_trip_random(tok):
         np.testing.assert_allclose(out[:, 2], notes[:, 2], atol=1e-9)
         true_dur, got_dur = notes[:, 3] - notes[:, 2], out[:, 3] - out[:, 2]
         err = np.abs(got_dur - true_dur)
-        assert np.all(err <= np.maximum(0.035 * true_dur, 0.01) + 1e-9)
+        assert np.all(err <= np.maximum(0.045 * true_dur, 0.01) + 1e-9)
 
 
 def test_short_durations_exact(tok):
-    durs = np.arange(1, 20)  # 10..190 ms: one bin per frame
+    durs = np.arange(1, 18)  # 10..170 ms: one bin per frame
     notes = [note(0, 0, 0.2 * i, 0.2 * i + d / FPS) for i, d in enumerate(durs)]
     out = tok.decode(tok.encode(notes))
     np.testing.assert_allclose(out[:, 3] - out[:, 2], durs / FPS, atol=1e-9)
@@ -115,23 +123,23 @@ def test_same_frame_collision_keeps_longer(tok):
 
 
 def test_window_edges(tok):
-    notes = [note(0, 0, 3.9, 4.5),   # starts before window [4, 8): dropped
-             note(1, 1, 4.0, 4.5),   # exactly at start: kept
-             note(2, 2, 7.5, 9.0),   # rings past the end: offset clipped to 8.0
-             note(3, 3, 8.0, 8.5)]   # exactly at the end: next window's
-    ids, stats = tok.encode(notes, start_s=4.0, return_stats=True)
-    out = tok.decode(ids, start_s=4.0)
+    notes = [note(0, 0, 9.9, 10.5),    # starts before window [10, 20): dropped
+             note(1, 1, 10.0, 10.5),   # exactly at start: kept
+             note(2, 2, 19.5, 21.0),   # rings past the end: offset clipped to 20.0
+             note(3, 3, 20.0, 20.5)]   # exactly at the end: next window's
+    ids, stats = tok.encode(notes, start_s=10.0, return_stats=True)
+    out = tok.decode(ids, start_s=10.0)
     assert list(out[:, 0]) == [1, 2]
     assert stats["offset_clipped"] == 1
-    np.testing.assert_allclose(out[1, 3], 8.0, atol=0.12)
-    assert out[1, 3] <= 8.0
-    rel = tok.notes_in_window(notes, start_s=4.0)
-    np.testing.assert_allclose(rel[:, 2:], [[0.0, 0.5], [3.5, 4.0]])
+    np.testing.assert_allclose(out[1, 3], 20.0, atol=0.12)
+    assert out[1, 3] <= 20.0
+    rel = tok.notes_in_window(notes, start_s=10.0)
+    np.testing.assert_allclose(rel[:, 2:], [[0.0, 0.5], [9.5, 10.0]])
 
 
 def test_onset_just_before_window_end(tok):
-    out = tok.decode(tok.encode([note(0, 0, 3.999, 4.0)]))
-    assert len(out) == 1 and out[0, 2] == pytest.approx(3.99) and out[0, 3] <= 4.0
+    out = tok.decode(tok.encode([note(0, 0, 9.999, 10.0)]))
+    assert len(out) == 1 and out[0, 2] == pytest.approx(9.99) and out[0, 3] <= 10.0
 
 
 @pytest.mark.parametrize("bad", [note(0, 20, 1.0, 2.0), note(6, 0, 1.0, 2.0),
@@ -144,7 +152,7 @@ def test_out_of_range_raises(tok, bad):
 
 def test_empty_window(tok):
     assert tok.encode(np.zeros((0, 4))) == [BOS_ID, EOS_ID]
-    assert tok.encode([note(0, 0, 9.0, 9.5)]) == [BOS_ID, EOS_ID]  # notes elsewhere
+    assert tok.encode([note(0, 0, 12.0, 12.5)]) == [BOS_ID, EOS_ID]  # notes elsewhere
     assert tok.decode([BOS_ID, EOS_ID]).shape == (0, 4)
 
 
@@ -183,7 +191,7 @@ def test_encoded_sequences_follow_mask(tok):
 
 def test_mask_rules(tok):
     m = tok.next_token_mask([BOS_ID])
-    assert m[EOS_ID] and m[tok.onset_offset:tok.dur_offset].all() and m.sum() == 401
+    assert m[EOS_ID] and m[tok.onset_offset:tok.dur_offset].all() and m.sum() == 1001
     chord = tok.encode([note(5, 0, 1.0, 2.0)])[:-1]  # high e already used at onset 100
     m = tok.next_token_mask(chord)
     assert not m[tok.onset_offset + 100] and m[tok.onset_offset + 101] and m[EOS_ID]
@@ -210,15 +218,15 @@ def test_mask_random_walks_decode_cleanly(tok):
 # ----- stitching -----
 
 def test_window_starts(tok):
-    assert tok.window_starts(10.0).tolist() == [0.0, 4.0, 8.0]
-    assert tok.window_starts(8.0).tolist() == [0.0, 4.0]
+    assert tok.window_starts(25.0).tolist() == [0.0, 10.0, 20.0]
+    assert tok.window_starts(20.0).tolist() == [0.0, 10.0]
     assert tok.window_starts(0.5).tolist() == [0.0]
 
 
 def test_stitch_full_clip(tok):
     rng = np.random.default_rng(3)
-    notes = np.concatenate([random_on_grid_notes(rng, 30, start_s=s) for s in [0.0, 4.0, 8.0]])
-    segments = [tok.decode(tok.encode(notes, s), s) for s in tok.window_starts(12.0)]
+    notes = np.concatenate([random_on_grid_notes(rng, 30, start_s=s) for s in [0.0, 10.0, 20.0]])
+    segments = [tok.decode(tok.encode(notes, s), s) for s in tok.window_starts(30.0)]
     full = stitch(segments)
     assert full.shape == notes.shape
     np.testing.assert_array_equal(full[:, :2], notes[:, :2])

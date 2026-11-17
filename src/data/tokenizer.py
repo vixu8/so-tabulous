@@ -11,13 +11,15 @@ Notes go in and come out in the same format as `tab_notes` from preprocessing.py
     float (N, 4) = [string, fret, onset_s, offset_s], string 0 = low E.
 
 Time:
-  - Windows are `segment_seconds` long (default 4 s) with 10 ms frames, matching
-    the Kong encoder's 100 frames/s.
+  - Windows are `segment_seconds` long (default 10 s, the same crop length as the
+    head loader) with 10 ms frames, matching the Kong encoder's 100 frames/s.
   - ONSET_k: onset rounded to the nearest frame k in [0, n_onset_frames).
-  - DUR_j: duration in frames, snapped to the nearest of 69 log-spaced bins
-    (exact up to 19 frames, then at most 1 frame or ~3% error, well inside
+  - DUR_j: duration in frames, snapped to the nearest of 75 log-spaced bins
+    (exact up to 17 frames, then at most 1 frame or ~4% error, well inside
     mir_eval's offset tolerance of max(50 ms, 20% of the duration)).
-  - Vocab with the defaults: 3 specials + 400 ONSET + 69 DUR + 6 STRING + 20 FRET = 498.
+  - Vocab with the defaults: 3 specials + 1000 ONSET + 75 DUR + 6 STRING + 20 FRET = 1104.
+    (4 s windows: 400 ONSET + 69 DUR = 498. On GuitarSet, 10 s windows cut 2.4% of
+    notes at a boundary vs 6.9% at 4 s; tokens per window p99 708, max 1218.)
 
 Window rules (encode):
   - Window [start, start + W) keeps the notes whose onset lies inside it.
@@ -36,8 +38,8 @@ import it.
 
 Example:
     tok = TabTokenizer()
-    ids = tok.encode(tab_notes, start_s=8.0)            # one 4 s window
-    notes = tok.decode(ids, start_s=8.0)                # back to (N, 4), absolute times
+    ids = tok.encode(tab_notes, start_s=10.0)           # one 10 s window
+    notes = tok.decode(ids, start_s=10.0)               # back to (N, 4), absolute times
     full = stitch([tok.decode(tok.encode(tab_notes, s), s)
                    for s in tok.window_starts(duration)])
 """
@@ -62,7 +64,7 @@ NOTE_PATTERN = (ONSET, DUR, STRING, FRET)
 
 @dataclass(frozen=True)
 class TabTokenizer:
-    segment_seconds: float = 4.0
+    segment_seconds: float = 10.0
     frames_per_second: int = 100
     n_duration_bins: int = 100  # before de-duplicating bins that round to the same frame
     n_strings: int = N_STRINGS

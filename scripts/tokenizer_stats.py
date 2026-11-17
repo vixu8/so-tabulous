@@ -60,7 +60,7 @@ def main():
     parser.add_argument("--hdf5_dir", required=True)
     parser.add_argument("--split", default=None, choices=["train", "validation", "test"],
                         help="only clips from this split (default: all)")
-    parser.add_argument("--segment_seconds", type=float, default=4.0)
+    parser.add_argument("--segment_seconds", type=float, default=10.0)
     parser.add_argument("--json_out", default=None, help="also write the summary here")
     args = parser.parse_args()
 
