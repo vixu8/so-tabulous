@@ -36,8 +36,8 @@ The adapter **adds** a guitar-specific correction; it never replaces Kong's orig
 |---|---|
 | `kong_encoder.py` | Load Kong's note weights; expose features and original piano predictions; freeze/unfreeze backbone |
 | `fusion_adapter.py` | Optional residual fusion adapter |
-| `tests/test_kong_wrapper.py` | Fast unit tests (mock backbone) |
-| `scripts/smoke_test_checkpoint.py` | Integration test with real Kong weights |
+| `../../tests/test_kong_wrapper.py` | Fast unit tests (mock backbone; in `tests/` at the repo root) |
+| `../../tests/test_kong_checkpoint.py` | Integration test with real Kong weights (in `tests/` at the repo root; skips if setup isn't done) |
 | `../../requirements/model.txt`, `../../requirements/dev.txt` | Dependencies (in `requirements/` at the repo root) |
 
 ## Setup
@@ -96,15 +96,16 @@ optimizer = torch.optim.AdamW(
 
 `backbone_frozen=True` keeps Kong's weights and batch-norm statistics fixed while the adapter remains trainable. For full fine-tuning, use `encoder.set_backbone_frozen(False)`. LoRA is **not** implemented in this package.
 
+Run these from the **repo root** (not this directory):
+
 ```bash
 # Unit tests (no checkpoint required)
-python -m pytest -q tests/
+python -m pytest -q tests/test_kong_wrapper.py
 
-# Real checkpoint test
-python scripts/smoke_test_checkpoint.py \
-  --checkpoint checkpoints/kong_note_pedal.pth \
-  --repo third_party/piano_transcription \
-  --device cpu
+# Real checkpoint test (uses checkpoints/ and third_party/ in this folder; runs on CPU)
+python -m pytest -q tests/test_kong_checkpoint.py
 ```
+
+The checkpoint test skips, with the reason, if the checkpoint, the cloned Kong repo, or a package from `requirements/model.txt` is missing; run pytest with `-rs` to see why.
 
 The offline unit tests passed when this package was created; the real-checkpoint integration test still needs to run in your environment. Because feature capture uses hooks, **do not run concurrent forwards on one wrapper instance** or use `nn.DataParallel`.

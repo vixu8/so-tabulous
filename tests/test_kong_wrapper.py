@@ -10,7 +10,7 @@ import pytest
 import torch
 from torch import nn
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "kong_wrapper"))
 from fusion_adapter import BRANCH_NAMES, ResidualKongFusion
 from kong_encoder import KongEncoder, _extract_note_state
 
