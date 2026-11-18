@@ -167,29 +167,53 @@ def _score_clip(task):
     return track_id, results
 
 
-def evaluate_split(head, rows, root, cache_dir, onset_ts, frame_ts, kong_repo, workers, log=print):
-    """Score every clip in `rows` for every threshold pair.
-
-    Returns ({pair: aggregate}, {pair: {track_id: est notes}}, {track_id: ref notes}).
-    """
-    tasks, refs = [], {}
+def reference_notes(root, rows):
+    """{track_id: tab_notes} from the clips' HDF5 files."""
+    refs = {}
     for track_id, rel in zip(rows.track_id, rows.hdf5_path):
         with h5py.File(Path(root) / rel, "r") as hf:
             refs[track_id] = hf["tab_notes"][:]
-        piano44, logits = clip_inputs(cache_dir, track_id, head)
-        tasks.append((track_id, piano44, logits, refs[track_id], list(onset_ts), list(frame_ts),
-                      str(kong_repo)))
+    return refs
+
+
+def make_pool(workers):
+    """A spawn pool for score_clips (None for workers <= 1). Reuse it across calls."""
+    return mp.get_context("spawn").Pool(workers) if workers > 1 else None
+
+
+def score_clips(clips, refs, onset_ts, frame_ts, kong_repo=DEFAULT_KONG_REPO, pool=None,
+                log=print):
+    """Score whole clips for every threshold pair.
+
+    clips: {track_id: (piano44 (4, T, 44), logits (T, 88, 6))} as numpy float32.
+    Returns ({pair: aggregate}, {pair: {track_id: est notes}}).
+    """
+    tasks = [(t, piano44, logits, refs[t], list(onset_ts), list(frame_ts), str(kong_repo))
+             for t, (piano44, logits) in clips.items()]
     t0 = time.time()
-    if workers > 1:
-        with mp.get_context("spawn").Pool(workers) as pool:
-            done = pool.map(_score_clip, tasks, chunksize=1)
-    else:
-        done = [_score_clip(t) for t in tasks]
+    done = pool.map(_score_clip, tasks, chunksize=1) if pool else [_score_clip(t) for t in tasks]
     log(f"  {len(tasks)} clips x {len(onset_ts) * len(frame_ts)} threshold pairs "
         f"in {time.time() - t0:.0f} s")
     pairs = [(o, f) for o in onset_ts for f in frame_ts]
     summary = {p: aggregate([res[p]["metrics"] for _, res in done]) for p in pairs}
     notes = {p: {t: res[p]["est"] for t, res in done} for p in pairs}
+    return summary, notes
+
+
+def evaluate_split(head, rows, root, cache_dir, onset_ts, frame_ts, kong_repo, workers, log=print):
+    """Score every clip in `rows` (Kong outputs from `cache_dir`) for every threshold pair.
+
+    Returns ({pair: aggregate}, {pair: {track_id: est notes}}, {track_id: ref notes}).
+    """
+    refs = reference_notes(root, rows)
+    clips = {t: clip_inputs(cache_dir, t, head) for t in rows.track_id}
+    pool = make_pool(workers)
+    try:
+        summary, notes = score_clips(clips, refs, onset_ts, frame_ts, kong_repo, pool, log)
+    finally:
+        if pool:
+            pool.close()
+            pool.join()
     return summary, notes, refs
 
 

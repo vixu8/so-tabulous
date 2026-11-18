@@ -62,8 +62,8 @@ def cache_meta(root, checkpoint):
     }
 
 
-def build_cache(root, cache_dir, meta, make_encoder, device, log=print):
-    """Cache Kong's piano outputs + targets for every clip in the manifest that lacks a file.
+def build_cache(root, cache_dir, meta, make_encoder, device, log=print, track_ids=None):
+    """Cache Kong's piano outputs + targets for every clip (or just `track_ids`) lacking a file.
 
     make_encoder() is called only if at least one clip still needs Kong.
     Raises if cache_dir was built with a different checkpoint / data root.
@@ -82,6 +82,8 @@ def build_cache(root, cache_dir, meta, make_encoder, device, log=print):
         meta_path.write_text(json.dumps(meta, indent=2))
 
     manifest = pd.read_csv(Path(root) / "manifest.csv", dtype={"player_id": str})
+    if track_ids is not None:
+        manifest = manifest[manifest.track_id.isin(set(track_ids))]
     todo = manifest[[not (cache_dir / f"{t}.npz").exists() for t in manifest.track_id]]
     if todo.empty:
         return 0
