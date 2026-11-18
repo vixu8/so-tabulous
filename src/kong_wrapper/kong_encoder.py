@@ -13,6 +13,12 @@ Output dict:
                           velocity_output -> each [B, T, 88] probabilities
 
 T is floor(samples / 160) + 1 (for standard input lengths); see README.
+
+Backprop fix: Kong's models.py:149 applies an in-place dropout to a ReLU output,
+which makes loss.backward() fail in train mode on current torch ("modified by an
+inplace operation"). When loading Kong, the wrapper gives that module a
+torch.nn.functional whose dropout is never in place (_NoInplaceDropoutFunctional).
+Kong's file is not edited and outputs are unchanged; training in train mode works.
 """
 
 from __future__ import annotations
@@ -50,6 +56,24 @@ def _in_sys_path(*directories: Path):
             sys.path.remove(value)
 
 
+class _NoInplaceDropoutFunctional:
+    """torch.nn.functional, except that dropout never runs in place.
+
+    Installed as `F` in the privately loaded copy of Kong's models.py, whose
+    AcousticModelCRnn8Dropout.forward (line 149) calls
+    F.dropout(..., inplace=True) on a ReLU output that ReLU's backward needs.
+    Out-of-place dropout computes the same values into a new tensor.
+    """
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(torch.nn.functional, name)
+
+    @staticmethod
+    def dropout(input: Tensor, p: float = 0.5, training: bool = True,
+                inplace: bool = False) -> Tensor:
+        return torch.nn.functional.dropout(input, p=p, training=training, inplace=False)
+
+
 def _make_upstream_note_model(repo_path: str | Path) -> nn.Module:
     """Import the official models.py without modifying or copying Kong source."""
     root = Path(repo_path).expanduser().resolve()
@@ -76,6 +100,9 @@ def _make_upstream_note_model(repo_path: str | Path) -> nn.Module:
             "Install requirements/model.txt (repo root), and check that "
             "the original repo exists at repo_path."
         ) from exc
+    # Fix Kong's in-place dropout (models.py:149) so backward works in train mode.
+    # Only this private module copy is affected; see _NoInplaceDropoutFunctional.
+    module.F = _NoInplaceDropoutFunctional()
     return module.Regress_onset_offset_frame_velocity_CRNN(
         frames_per_second=FRAMES_PER_SECOND, classes_num=PIANO_PITCHES
     )
@@ -104,9 +131,9 @@ class KongEncoder(nn.Module):
     `fusion_adapter` remains trainable. A frozen backbone stays in eval mode,
     even when the outer wrapper is in train mode.
 
-    For fine-tuning or LoRA, call set_backbone_frozen(False), then manage the
-    exact trainable backbone/LoRA parameters as required. The wrapper itself
-    does not insert LoRA layers.
+    For full fine-tuning, call set_backbone_frozen(False); the backbone then
+    follows train()/eval() and backprops in train mode (Kong's in-place dropout
+    is fixed at load time). For LoRA, use TunableKongEncoder in lora.py.
 
     Hooks store per-forward activations. Do not run concurrent forwards on the
     same instance or use torch.nn.DataParallel; use separate replicas / DDP.

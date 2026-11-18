@@ -57,3 +57,47 @@ def test_piano_output_shapes(outputs):
 def test_adapter_starts_as_identity(outputs):
     # Zero-initialized last adapter layer -> features == Kong's frame_gru output exactly
     torch.testing.assert_close(outputs["features"], outputs["pretrained_features"], rtol=0, atol=0)
+
+
+def load_unfrozen():
+    if not CHECKPOINT.is_file() or not REPO.is_dir():
+        pytest.skip("Kong checkpoint or repo missing (see src/kong_wrapper/README.md)")
+    try:
+        return KongEncoder.from_checkpoint(CHECKPOINT, repo_path=REPO, backbone_frozen=False)
+    except ImportError as exc:
+        pytest.skip(str(exc))
+
+
+def kong_functional(encoder):
+    """The `F` that Kong's models.py sees (its private module's globals)."""
+    return type(encoder.note_model.frame_model).forward.__globals__
+
+
+def test_full_finetune_backprops_in_train_mode():
+    # Kong's models.py:149 does an in-place dropout on a ReLU output; the wrapper
+    # swaps in an out-of-place dropout at load time so backward works in train mode.
+    torch.manual_seed(0)
+    audio = torch.randn(1, 16000 * SECONDS) * 0.1
+    patched = load_unfrozen()
+    original = load_unfrozen()
+    kong_functional(original)["F"] = torch.nn.functional   # Kong exactly as published
+
+    # Same outputs in eval mode with and without the fix.
+    patched.eval(), original.eval()
+    with torch.no_grad():
+        a, b = patched(audio), original(audio)
+    torch.testing.assert_close(a["features"], b["features"], rtol=0, atol=0)
+    for key in a["piano"]:
+        torch.testing.assert_close(a["piano"][key], b["piano"][key], rtol=0, atol=0)
+
+    # The published code fails in train mode; the fixed one trains, with dropout on.
+    original.train()
+    with pytest.raises(RuntimeError, match="inplace"):
+        original(audio)["piano"]["frame_output"].mean().backward()
+    patched.train()
+    assert patched.note_model.training
+    out = patched(audio)
+    assert not torch.equal(out["features"], patched(audio)["features"])   # dropout active
+    (out["piano"]["frame_output"].mean() + out["features"].mean()).backward()
+    assert patched.note_model.frame_model.fc5.weight.grad.abs().sum() > 0
+    assert patched.note_model.frame_model.conv_block1.conv1.weight.grad is not None

@@ -36,6 +36,8 @@ The adapter **adds** a guitar-specific correction; it never replaces Kong's orig
 |---|---|
 | `kong_encoder.py` | Load Kong's note weights; expose features and original piano predictions; freeze/unfreeze backbone |
 | `fusion_adapter.py` | Optional residual fusion adapter |
+| `lora.py` | `TunableKongEncoder` (frozen / LoRA / full fine-tuning modes) and LoRA helpers |
+| `../../tests/test_kong_lora.py` | LoRA tests (toy model + real checkpoint) |
 | `../../tests/test_kong_wrapper.py` | Fast unit tests (mock backbone; in `tests/` at the repo root) |
 | `../../tests/test_kong_checkpoint.py` | Integration test with real Kong weights (in `tests/` at the repo root; skips if setup isn't done) |
 | `../../requirements/model.txt`, `../../requirements/dev.txt` | Dependencies (in `requirements/` at the repo root) |
@@ -94,7 +96,49 @@ optimizer = torch.optim.AdamW(
 # Train using your head's tab loss on head(encoder(audio)['features']).
 ```
 
-`backbone_frozen=True` keeps Kong's weights and batch-norm statistics fixed while the adapter remains trainable. For full fine-tuning, use `encoder.set_backbone_frozen(False)`. LoRA is **not** implemented in this package.
+`backbone_frozen=True` keeps Kong's weights and batch-norm statistics fixed while the adapter remains trainable.
+
+## Fine-tuning (frozen / LoRA / full)
+
+Use `TunableKongEncoder` from `lora.py` for any run that updates Kong. It is a `KongEncoder` with three modes:
+
+```python
+from lora import TunableKongEncoder, lora_state_dict, merge_lora
+
+encoder = TunableKongEncoder.from_checkpoint('checkpoints/kong_note_pedal.pth')  # "frozen"
+encoder.set_finetune('lora', rank=8, alpha=16)   # or 'frozen' / 'full'
+encoder.to('cuda').train()
+
+optimizer = torch.optim.AdamW(
+    [*encoder.trainable_parameters(), *head.parameters()],  # + adapter if used
+    lr=1e-4,
+)
+# ... train; save only the LoRA weights (~2 MB) next to the head:
+torch.save(lora_state_dict(encoder.note_model), 'lora.pt')
+```
+
+| Mode | What trains in Kong |
+|---|---|
+| `frozen` | nothing (`no_grad` forward) |
+| `lora` | low-rank `W + (alpha/rank)·B·A` on all 10 Linear weights and every GRU `weight_ih` / `weight_hh` (biases untouched): 486,400 weights at rank 8, about 2% of Kong |
+| `full` | every Kong weight (call `merge_lora(encoder.note_model)` first if LoRA is attached) |
+
+- **LoRA starts as the identity:** B is zero, so a fresh LoRA leaves every output unchanged.
+- **In `lora` and `full`, Kong follows `train()` / `eval()`**, so dropout is on while training, as in Kong's own training. Batch-norm always keeps its pretrained statistics, so a saved LoRA file (A and B only) fully describes the model, and small batches don't add noise. The adapter, if any, follows `train()` / `eval()` as usual.
+- **Kong's backprop bug is fixed at load time:** `models.py:149` uses an in-place dropout that breaks `backward()` in train mode. `kong_encoder.py` gives Kong's module an out-of-place dropout instead. Kong's file isn't edited and outputs are unchanged. This also fixes plain `KongEncoder` with `set_backbone_frozen(False)`.
+- **Change modes with `set_finetune`**, not `set_backbone_frozen`.
+- **Heads, the decoder and the fusion adapter train fully** on top of a LoRA'd Kong. LoRA is only for the large pretrained backbone.
+- **Other helpers:** `load_lora_state_dict` restores saved LoRA weights; `merge_lora` folds them into plain weights for inference.
+- **Implementation:** LoRA uses `torch.nn.utils.parametrize`, not `peft`, because `peft` can't wrap `nn.GRU`.
+
+Laptop timing (M3 Max, MPS, 10 s crops, one training step):
+
+| Batch | LoRA | Full fine-tuning |
+|---|---|---|
+| 4 | 5.0 s, 3.8 GB | 5.9 s, 11.9 GB |
+| 8 | 5.5 s, 6.5 GB | 8.2 s, 22.6 GB |
+
+(train mode with dropout on)
 
 Run these from the **repo root** (not this directory):
 
