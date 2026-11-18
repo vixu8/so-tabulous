@@ -26,7 +26,7 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
-from fusion_adapter import BRANCH_NAMES, ResidualKongFusion
+from .fusion_adapter import BRANCH_NAMES, ResidualKongFusion
 
 SAMPLE_RATE = 16_000
 FRAMES_PER_SECOND = 100
