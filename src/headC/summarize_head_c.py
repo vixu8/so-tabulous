@@ -1,0 +1,92 @@
+"""Average Head C results over the six leave-one-player-out folds.
+
+    python src/headC/summarize_head_c.py --runs runs/head_c --stage stage1
+
+Reads <runs>/<stage>_val{V}_test{T}/eval.json (note level, from eval_head_c.py)
+and metrics.json (frame level, from train_head_c.py) for every fold in
+scripts/run_folds.py's FOLDS, and reports each fold's test numbers plus the mean
+and standard deviation over folds (the number to quote). Thresholds are the ones
+each fold chose on its own validation player. Writes <runs>/<stage>_lopo.json.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+
+REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "scripts"))
+from run_folds import FOLDS  # noqa: E402
+
+# (name, getter on eval.json["test"]["chosen"]) for the note-level table
+NOTE_METRICS = [
+    ("note_f1", lambda r: r["note_onset"]["pooled"]["f1"]),
+    ("note_f1_offset", lambda r: r["note_offset"]["pooled"]["f1"]),
+    ("tab_f1", lambda r: r["tab_onset"]["pooled"]["f1"]),
+    ("tab_f1_offset", lambda r: r["tab_offset"]["pooled"]["f1"]),
+    ("playability", lambda r: r["playability"]["pooled"]["rate"]),
+    ("note_f1_clip_mean", lambda r: r["note_onset"]["mean_f1"]),
+    ("tab_f1_clip_mean", lambda r: r["tab_onset"]["mean_f1"]),
+    ("note_precision", lambda r: r["note_onset"]["pooled"]["precision"]),
+    ("note_recall", lambda r: r["note_onset"]["pooled"]["recall"]),
+]
+
+
+def fold_row(run_dir):
+    ev = json.loads((run_dir / "eval.json").read_text())
+    tr = json.loads((run_dir / "metrics.json").read_text())
+    chosen = ev["test"]["chosen"]
+    frame_t = str(tr["threshold"])
+    row = {name: get(chosen) for name, get in NOTE_METRICS}
+    row.update({
+        "string_acc": tr["test"]["string_acc"],
+        "frame_tab_f1": tr["test"]["frame"][frame_t]["tab"]["f1"],
+        "onset_threshold": ev["thresholds"]["chosen"]["onset"],
+        "frame_threshold_notes": ev["thresholds"]["chosen"]["frame"],
+        "frame_threshold_grid": tr["threshold"],
+        "best_epoch": tr["best_epoch"],
+    })
+    return row
+
+
+def summarize(runs, stage="stage1"):
+    folds = {}
+    for test, val in FOLDS.items():
+        run_dir = Path(runs) / f"{stage}_val{val}_test{test}"
+        if not (run_dir / "eval.json").is_file():
+            raise FileNotFoundError(f"missing {run_dir / 'eval.json'}; run all folds first "
+                                    "(scripts/run_folds.py)")
+        folds[f"test{test}_val{val}"] = fold_row(run_dir)
+    keys = [k for k in next(iter(folds.values())) if "threshold" not in k and k != "best_epoch"]
+    mean = {k: float(np.mean([f[k] for f in folds.values()])) for k in keys}
+    std = {k: float(np.std([f[k] for f in folds.values()], ddof=1)) for k in keys}
+    return {"folds": folds, "mean": mean, "std": std}
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument("--runs", default=str(REPO / "runs" / "head_c"))
+    p.add_argument("--stage", default="stage1")
+    a = p.parse_args()
+    s = summarize(a.runs, a.stage)
+
+    cols = ["note_f1", "note_f1_offset", "tab_f1", "tab_f1_offset", "playability",
+            "string_acc", "frame_tab_f1"]
+    head = ["note", "note+off", "tab", "tab+off", "playable", "str acc", "frame tab"]
+    print(f"{'fold':<14}" + "".join(f"{h:>10}" for h in head) + "   onset/frame thr")
+    for name, f in s["folds"].items():
+        print(f"{name:<14}" + "".join(f"{f[c]:10.3f}" for c in cols)
+              + f"   {f['onset_threshold']}/{f['frame_threshold_notes']}")
+    print(f"{'mean':<14}" + "".join(f"{s['mean'][c]:10.3f}" for c in cols))
+    print(f"{'std':<14}" + "".join(f"{s['std'][c]:10.3f}" for c in cols))
+    out = Path(a.runs) / f"{a.stage}_lopo.json"
+    out.write_text(json.dumps(s, indent=2))
+    print(f"saved {out}")
+
+
+if __name__ == "__main__":
+    main()
