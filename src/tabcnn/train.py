@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import time
 from pathlib import Path
 
 import numpy as np
@@ -39,10 +40,12 @@ METRIC_FNS = {
 }
 
 
-def train_one_fold(model, loader, optimizer, epochs, device):
+def train_one_fold(model, loader, optimizer, epochs, device, log_every=0):
     model.train()
+    n_steps = len(loader)
     for epoch in range(epochs):
         running_loss = running_acc = n_batches = 0
+        t_epoch = time.time()
         for x, y in loader:
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
@@ -53,14 +56,22 @@ def train_one_fold(model, loader, optimizer, epochs, device):
             running_loss += loss.item()
             running_acc += avg_acc(logits, y).item()
             n_batches += 1
+            # Optional within-epoch progress so long epochs aren't silent.
+            if log_every and n_batches % log_every == 0:
+                rate = n_batches / (time.time() - t_epoch)
+                print(f"    epoch {epoch + 1}/{epochs}  step {n_batches}/{n_steps}  "
+                      f"loss {running_loss / n_batches:.4f}  "
+                      f"acc {running_acc / n_batches:.4f}  "
+                      f"{rate:.1f} it/s", flush=True)
         print(f"  epoch {epoch + 1}/{epochs}  "
               f"loss {running_loss / n_batches:.4f}  "
-              f"acc {running_acc / n_batches:.4f}")
+              f"acc {running_acc / n_batches:.4f}  "
+              f"({time.time() - t_epoch:.0f} s)", flush=True)
 
 
 @torch.no_grad()
-def predict_validation(model, dataset, batch_size, device):
-    """Run the model over the whole validation set, returning (y_pred, y_gt)
+def predict_test(model, dataset, batch_size, device):
+    """Run the model over the whole test set, returning (y_pred, y_gt)
     as NumPy arrays shaped (N, 6, 21)."""
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     preds, gts = [], []
@@ -80,6 +91,8 @@ def main():
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--log_every", type=int, default=0,
+                        help="print progress every N steps within an epoch (0 = only per-epoch)")
     parser.add_argument("--save_path", default="saved/")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -101,7 +114,7 @@ def main():
         common = dict(data_path=args.data_path, spec_repr=args.spec_repr,
                       con_win_size=args.con_win_size)
         train_set = TabFrameDataset(partition["training"], **common)
-        val_set = TabFrameDataset(partition["validation"], **common)
+        test_set = TabFrameDataset(partition["test"], **common)
         train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
                                   num_workers=args.num_workers, drop_last=True)
 
@@ -114,11 +127,11 @@ def main():
         optimizer = torch.optim.Adadelta(model.parameters(), lr=1.0, rho=0.95, eps=1e-7)
 
         print("training...")
-        train_one_fold(model, train_loader, optimizer, args.epochs, device)
+        train_one_fold(model, train_loader, optimizer, args.epochs, device, args.log_every)
         torch.save(model.state_dict(), split_folder / "weights.pt")
 
         print("testing...")
-        y_pred, y_gt = predict_validation(model, val_set, args.batch_size, device)
+        y_pred, y_gt = predict_test(model, test_set, args.batch_size, device)
         np.savez(split_folder / "predictions.npz", y_pred=y_pred, y_gt=y_gt)
 
         print("evaluation...")
