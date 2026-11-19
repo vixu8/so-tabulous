@@ -4,7 +4,7 @@
     python src/headC/summarize_head_c.py --stage stage2_lam0.2 --folds 05   # lambda sweep
 
 Reads <runs>/<stage>_val{V}_test{T}/eval.json (note level, from eval_head_c.py)
-and metrics.json (frame level, from train_head_c.py / train_head_c_stage2.py) for
+and metrics.json (frame level, from train_head_c.py --stage 1 / --stage 2) for
 every fold in scripts/run_folds.py's FOLDS (or just --folds), and reports each
 fold's test numbers plus the mean and standard deviation over folds (the number
 to quote). The VAL tab column is validation Tab F1, the number to choose settings

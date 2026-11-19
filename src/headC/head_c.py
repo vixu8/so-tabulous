@@ -16,8 +16,8 @@ Shapes:
   string_per_pitch target   [B, T, 88] string index, IGNORE_INDEX where silent
                             (built by src/data/loader.py)
 
-Stage 1 (now): build the encoder with backbone_frozen=True; only the head trains.
-Stage 2 (LoRA + Kong's own loss) is added once the shared LoRA setup exists.
+Stage 1: Kong frozen (TunableKongEncoder in "frozen" mode), only the head trains.
+Stage 2: LoRA on Kong + the head, with Kong's own loss added (train_head_c.py --stage 2).
 Head C reads only `piano`, so it never uses the fusion adapter.
 """
 
@@ -88,6 +88,12 @@ class KongHeadC(nn.Module):
     def forward(self, waveform: Tensor) -> dict[str, Tensor | dict[str, Tensor]]:
         piano = self.encoder(waveform)["piano"]
         return {"string_logits": self.head(piano), "piano": piano}
+
+
+def as_piano(piano_batch: Tensor) -> dict[str, Tensor]:
+    """[B, 4, T, 88] stacked Kong outputs (e.g. a float16 cache slice) -> HeadC's input dict."""
+    x = piano_batch.float()
+    return {k: x[:, i] for i, k in enumerate(PIANO_KEYS)}
 
 
 def string_loss(logits: Tensor, target: Tensor) -> Tensor:

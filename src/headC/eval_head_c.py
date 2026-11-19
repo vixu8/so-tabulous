@@ -19,8 +19,10 @@ own defaults (onset 0.3, offset 0.3, frame 0.1), for reference.
 
 Writes eval.json and test_notes.npz into --run_dir.
 
-Stage 1 only: it reads Kong's outputs from the cache. Stage 2 changes Kong, so
-clip_inputs() is the place to swap in a live encoder.
+Kong's outputs come from the run's own cache (<run_dir>/kong_cache, best.pt's
+args.cache_dir), which train_head_c.py builds from the run's best model (frozen
+Kong in stage 1, LoRA'd Kong in stage 2) and deletes afterwards unless
+--keep_cache. To re-run this script later, train with --keep_cache.
 """
 
 from __future__ import annotations
@@ -42,10 +44,9 @@ HERE = Path(__file__).resolve().parent
 for _sub in (HERE, HERE.parent / "data", HERE.parent / "metrics"):
     if str(_sub) not in sys.path:
         sys.path.insert(0, str(_sub))
-from head_c import HeadC, assign_strings  # noqa: E402
+from head_c import HeadC, as_piano, assign_strings  # noqa: E402
 from loader import load_split  # noqa: E402
 from tab_metrics import aggregate, note_metrics, playability  # noqa: E402
-from train_head_c import as_piano  # noqa: E402
 
 FRAMES_PER_SECOND = 100
 FRAMES_PER_WINDOW = 1000            # frame 1000 of a window = frame 0 of the next

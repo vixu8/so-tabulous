@@ -61,6 +61,8 @@ Only the **note-model weights** are loaded from the combined note+pedal checkpoi
 
 ## Usage
 
+Imports are flat: put `src/kong_wrapper` on `sys.path` (scripts in `src/headA`, `src/headC` and `tests/` do this at the top) and `from kong_encoder import KongEncoder`. `from kong_wrapper.kong_encoder import KongEncoder` with `src/` on `sys.path` also works, but don't mix the two styles in one process (you would get two different `KongEncoder` classes).
+
 ```python
 import torch
 from kong_encoder import KongEncoder

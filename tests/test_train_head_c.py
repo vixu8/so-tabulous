@@ -1,9 +1,10 @@
-"""Tests for the Head C stage 1 trainer: Kong-output cache and a tiny end-to-end run.
+"""Tests for the Head C trainer (src/headC/train_head_c.py, both stages).
 
-frame_metrics is tested in tests/test_tab_metrics.py.
+The cache and loss tests need nothing; the end-to-end test runs real Kong (frozen,
+then LoRA) on CPU over a tiny synthetic dataset and skips if the Kong checkpoint /
+repo is missing. frame_metrics is tested in tests/test_tab_metrics.py.
 """
 
-import argparse
 import json
 from pathlib import Path
 import sys
@@ -16,49 +17,64 @@ import torch
 from torch import nn
 
 SRC = Path(__file__).resolve().parents[1] / "src"
-for sub in ("headC",):
-    sys.path.insert(0, str(SRC / sub))
+sys.path.insert(0, str(SRC / "headC"))
 from train_head_c import (PIANO_KEYS, build_cache, cache_meta, load_windows,  # noqa: E402
-                          run)
+                          parse_args, run, stage1_loss, stage2_loss)
 from loader import (IGNORE_INDEX, OPEN_STRING_MIDI, SAMPLE_RATE,  # noqa: E402
                     GuitarSetDataset)
 
+KONG_DIR = SRC / "kong_wrapper"
+CHECKPOINT = KONG_DIR / "checkpoints" / "kong_note_pedal.pth"
+KONG_REPO = KONG_DIR / "third_party" / "piano_transcription"
+needs_kong = pytest.mark.skipif(not (CHECKPOINT.is_file() and KONG_REPO.is_dir()),
+                                reason="Kong checkpoint / repo missing (see src/kong_wrapper/README.md)")
+
 
 # ----- synthetic clips (same schema as tests/test_loader.py's write_clip; copied, tests
-# aren't a package) and a fake frozen encoder -----
+# aren't a package) -----
 
 NOTES = [[0, 3, 0.50, 1.20], [2, 2, 0.50, 1.20], [1, 0, 9.50, 10.80],
          [5, 12, 12.00, 12.50], [3, 5, 24.00, 24.90]]
 
 
-def write_clip(path, duration_s, tab_notes, player):
+def write_clip(path, duration_s, tab_notes, player, noise_seed=None):
     n = int(duration_s * SAMPLE_RATE)
     tab_notes = np.asarray(tab_notes, dtype=np.float32)
-    events, times = [], []
+    events = []
     for s, f, on, off in tab_notes:
         pitch = OPEN_STRING_MIDI[int(s)] + int(f)
         events += [(on, 1, f"note_on channel=0 note={pitch} velocity=64 time=0"),
                    (off, 0, f"note_on channel=0 note={pitch} velocity=0 time=0")]
     events.sort(key=lambda e: (e[0], e[1]))
+    if noise_seed is None:
+        audio = (np.arange(n) % 2000 - 1000).astype(np.int16)
+    else:
+        audio = (np.random.default_rng(noise_seed).standard_normal(n) * 2000).astype(np.int16)
     with h5py.File(path, "w") as hf:
         hf.attrs.create("player_id", data=player.encode(), dtype="S100")
         hf.attrs.create("sample_rate", data=SAMPLE_RATE, dtype=np.int32)
-        hf.create_dataset("waveform", data=(np.arange(n) % 2000 - 1000).astype(np.int16))
+        hf.create_dataset("waveform", data=audio)
         hf.create_dataset("midi_event", data=[e[2].encode() for e in events], dtype="S100")
         hf.create_dataset("midi_event_time", data=np.array([e[0] for e in events], np.float32))
         hf.create_dataset("tab_notes", data=tab_notes)
 
 
+def make_root(root, duration_s, notes, noise=False):
+    (root / "hdf5s").mkdir(parents=True)
+    rows = []
+    for i, player in enumerate(["00", "01", "02", "03", "04", "05"]):
+        track = f"{player}_Test0-100-C_comp"
+        write_clip(root / "hdf5s" / f"{track}.h5", duration_s, notes, player,
+                   noise_seed=i if noise else None)
+        rows.append({"track_id": track, "player_id": player, "duration": duration_s,
+                     "hdf5_path": f"hdf5s/{track}.h5"})
+    pd.DataFrame(rows).to_csv(root / "manifest.csv", index=False)
+    return root
+
+
 @pytest.fixture
 def root(tmp_path):
-    (tmp_path / "hdf5s").mkdir()
-    rows = []
-    for player in ["00", "01", "02", "03", "04", "05"]:
-        track = f"{player}_Test0-100-C_comp"
-        write_clip(tmp_path / "hdf5s" / f"{track}.h5", 25.0, NOTES, player)
-        rows.append({"track_id": track, "player_id": player, "duration": 25.0,
-                     "hdf5_path": f"hdf5s/{track}.h5"})
-    pd.DataFrame(rows).to_csv(tmp_path / "manifest.csv", index=False)
+    make_root(tmp_path, 25.0, NOTES)
     (tmp_path / "fake.pth").write_bytes(b"0" * 10)
     return tmp_path
 
@@ -106,20 +122,115 @@ def test_build_cache_shapes_reuse_and_meta_check(root, tmp_path):
     assert last == 501 and (data["spp"][-1, last:] == IGNORE_INDEX).all()
 
 
-def test_run_end_to_end(root, tmp_path):
-    args = argparse.Namespace(
-        root=str(root), val_player="04", test_player="05", checkpoint=str(root / "fake.pth"),
-        cache_dir=str(tmp_path / "cache"), out_dir=str(tmp_path / "runs"), epochs=5,
-        patience=5, lr=1e-2, weight_decay=0.0, batch_size=4, hidden=32, dropout=0.0,
-        seed=0, device="cpu")
-    res = run(args, make_encoder=FakeEncoder, log=lambda *_: None)
+# ----- losses -----
 
-    hist = res["history"]
-    assert hist[0]["epoch"] == 0 and len(hist) == 6
-    # Every clip has the same notes, so the head can learn them; val loss must drop.
-    assert min(h["val_string_loss"] for h in hist[1:]) < hist[0]["val_string_loss"]
-    out = Path(args.out_dir) / "stage1_val04_test05"
-    ckpt = torch.load(out / "best.pt", weights_only=False)
-    assert ckpt["threshold"] == res["threshold"] and "mlp.0.weight" in ckpt["head"]
-    saved = json.loads((out / "metrics.json").read_text())
-    assert set(saved) >= {"history", "validation", "test", "threshold", "best_epoch"}
+def bce(output, target, mask):
+    """Same formula as Kong's pytorch/losses.py bce."""
+    output = torch.clamp(output, 1e-7, 1 - 1e-7)
+    matrix = -target * torch.log(output) - (1 - target) * torch.log(1 - output)
+    return torch.sum(matrix * mask) / torch.sum(mask)
+
+
+def loss_inputs():
+    torch.manual_seed(0)
+    b, t = 2, 30
+    out = {"piano": {k: torch.rand(b, t, 88) * 0.98 + 0.01 for k in PIANO_KEYS},
+           "string_logits": torch.randn(b, t, 88, 6)}
+    spp = torch.full((b, t, 88), IGNORE_INDEX)
+    spp[:, :, 40 - 21] = 0
+    batch = {"n_valid_frames": torch.tensor([30, 12]), "string_per_pitch": spp,
+             "mask_roll": torch.ones(b, t, 88)}
+    for roll in ("reg_onset_roll", "reg_offset_roll", "frame_roll"):
+        batch[roll] = (torch.rand(b, t, 88) > 0.9).float()
+    return out, batch
+
+
+def scramble_padding(out, batch):
+    """Change everything in item 1's padded frames (>= 12)."""
+    for k in PIANO_KEYS:
+        out["piano"][k][1, 12:] = 0.5
+    out["string_logits"][1, 12:] = 100.0
+    for roll in ("reg_onset_roll", "reg_offset_roll", "frame_roll"):
+        batch[roll][1, 12:] = 1.0
+
+
+def test_stage2_loss_masks_padding_and_weights_lambda():
+    out, batch = loss_inputs()
+    total1, parts1 = stage2_loss(out, batch, 1.0, bce)
+    total3, parts3 = stage2_loss(out, batch, 3.0, bce)
+    kong = parts1["onset"] + parts1["offset"] + parts1["frame"]
+    torch.testing.assert_close(total1, kong + parts1["string"])
+    torch.testing.assert_close(total3, kong + 3 * parts1["string"])
+    scramble_padding(out, batch)
+    total_after, _ = stage2_loss(out, batch, 1.0, bce)
+    torch.testing.assert_close(total_after, total1)
+
+
+def test_stage1_loss_is_string_loss_and_masks_padding():
+    out, batch = loss_inputs()
+    total, parts = stage1_loss(out, batch)
+    assert set(parts) == {"string"}
+    torch.testing.assert_close(total, stage2_loss(out, batch, 1.0, bce)[1]["string"])
+    scramble_padding(out, batch)
+    torch.testing.assert_close(stage1_loss(out, batch)[0], total)
+
+
+# ----- end to end with real Kong (CPU, tiny synthetic data): stage 1 -> stage 2 -> resume -----
+
+@needs_kong
+def test_stage1_then_stage2_end_to_end_and_resume(tmp_path):
+    root = make_root(tmp_path / "data", 12.0, [[2, 2, 1.0, 1.5], [4, 1, 1.0, 1.5], [0, 3, 5.0, 6.0]],
+                     noise=True)
+    out_dir = tmp_path / "runs"
+    base = ["--root", str(root), "--out_dir", str(out_dir), "--device", "cpu",
+            "--batch_size", "2", "--crops_per_clip", "1", "--num_workers", "0",
+            "--workers", "1", "--checkpoint", str(CHECKPOINT), "--kong_repo", str(KONG_REPO),
+            "--lr", "1e-3"]
+    quiet = lambda *_: None  # noqa: E731
+
+    # Stage 1: frozen Kong, fresh head.
+    run(parse_args(base + ["--stage", "1", "--epochs", "1", "--hidden", "16"]), log=quiet)
+    s1 = out_dir / "stage1_val04_test05"
+    best1 = torch.load(s1 / "best.pt", weights_only=False)
+    assert best1["stage"] == 1 and "lora" not in best1 and best1["hidden"] == 16
+    hist = json.loads((s1 / "metrics.json").read_text())["history"]
+    assert [h["epoch"] for h in hist] == [0, 1] and set(hist[1]["train_loss"]) == {"string", "total"}
+    assert "chosen" in json.loads((s1 / "eval.json").read_text())["test"]
+    assert (s1 / "test_notes.npz").exists() and not (s1 / "kong_cache").exists()
+
+    # Stage 2: LoRA'd Kong, head from stage 1.
+    run(parse_args(base + ["--stage", "2", "--epochs", "1"]), log=quiet)
+    run_dir = out_dir / "stage2_val04_test05"
+    hist = json.loads((run_dir / "metrics.json").read_text())["history"]
+    assert [h["epoch"] for h in hist] == [0, 1]
+    assert {"onset", "offset", "frame", "string", "total"} <= set(hist[1]["train_loss"])
+    assert {"total", "string"} <= set(hist[1]["val_loss"])
+    # Epoch 0 of stage 2 is stage 1's best head with Kong unchanged.
+    assert hist[0]["val_tab_f1"] == pytest.approx(
+        json.loads((s1 / "metrics.json").read_text())["history"][best1["best_epoch"]]["val_tab_f1"])
+    best = torch.load(run_dir / "best.pt", weights_only=False)
+    assert best["stage"] == 2 and best["lora"] and best["args"]["lam"] == 0.2
+    ev = json.loads((run_dir / "eval.json").read_text())
+    assert "chosen" in ev["test"] and (run_dir / "test_notes.npz").exists()
+    assert not (run_dir / "kong_cache").exists()            # removed unless --keep_cache
+    last = torch.load(run_dir / "last.pt", weights_only=False)
+    trained_b = [v for k, v in last["state"]["lora"].items() if k.endswith(".B")]
+    assert any(v.abs().sum() > 0 for v in trained_b)          # LoRA actually trained
+
+    # A finished run is skipped by --resume; an unfinished one continues after its last epoch.
+    stage2 = base + ["--stage", "2", "--epochs", "2", "--resume"]
+    mtime = (run_dir / "eval.json").stat().st_mtime
+    run(parse_args(stage2), log=quiet)
+    assert (run_dir / "eval.json").stat().st_mtime == mtime
+    (run_dir / "eval.json").unlink()                          # as if interrupted after epoch 1
+    run(parse_args(stage2), log=quiet)
+    hist = json.loads((run_dir / "metrics.json").read_text())["history"]
+    assert [h["epoch"] for h in hist] == [0, 1, 2]
+
+
+def test_parse_args_stage_defaults():
+    a1 = parse_args(["--stage", "1"])
+    a2 = parse_args(["--stage", "2", "--lr", "3e-4", "--test_player", "5"])
+    assert (a1.lr, a1.weight_decay, a1.epochs, a1.tag) == (1e-3, 1e-4, 50, "stage1")
+    assert (a2.lr, a2.weight_decay, a2.epochs, a2.tag) == (3e-4, 0.0, 40, "stage2")
+    assert a2.test_player == "05"

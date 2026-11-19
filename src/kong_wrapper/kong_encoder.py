@@ -32,7 +32,13 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
-from .fusion_adapter import BRANCH_NAMES, ResidualKongFusion
+# Works both as `from kong_encoder import ...` (src/kong_wrapper on sys.path, the
+# repo's convention) and as `from kong_wrapper.kong_encoder import ...` (src/ on
+# sys.path). Pick one style per process: mixing them loads two KongEncoder classes.
+try:
+    from .fusion_adapter import BRANCH_NAMES, ResidualKongFusion
+except ImportError:
+    from fusion_adapter import BRANCH_NAMES, ResidualKongFusion
 
 SAMPLE_RATE = 16_000
 FRAMES_PER_SECOND = 100

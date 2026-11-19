@@ -15,8 +15,8 @@ Run commands for every fold; {val} and {test} are filled in, and commands run
 from the repo root, in order, stopping at the first failure:
 
     python scripts/run_folds.py \\
-        --cmd "python src/headC/train_head_c.py --val_player {val} --test_player {test}" \\
-        --cmd "python src/headC/eval_head_c.py --run_dir runs/head_c/stage1_val{val}_test{test}"
+        --cmd "python src/headA/train_head_a.py --stage 1 --val_player {val} --test_player {test}" \\
+        --cmd "python src/headA/train_head_a.py --stage 2 --val_player {val} --test_player {test}"
 
     python scripts/run_folds.py --folds 00 03 --cmd "..."     # only some test players
     python scripts/run_folds.py --dry_run --cmd "..."         # print, don't run
