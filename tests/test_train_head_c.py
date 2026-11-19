@@ -188,30 +188,31 @@ def test_stage1_then_stage2_end_to_end_and_resume(tmp_path):
             "--lr", "1e-3"]
     quiet = lambda *_: None  # noqa: E731
 
-    # Stage 1: frozen Kong, fresh head.
+    # Stage 1: frozen Kong, fresh head, fixed number of epochs.
     run(parse_args(base + ["--stage", "1", "--epochs", "1", "--hidden", "16"]), log=quiet)
-    s1 = out_dir / "stage1_val04_test05"
-    best1 = torch.load(s1 / "best.pt", weights_only=False)
-    assert best1["stage"] == 1 and "lora" not in best1 and best1["hidden"] == 16
-    hist = json.loads((s1 / "metrics.json").read_text())["history"]
-    assert [h["epoch"] for h in hist] == [0, 1] and set(hist[1]["train_loss"]) == {"string", "total"}
-    assert "chosen" in json.loads((s1 / "eval.json").read_text())["test"]
+    s1 = out_dir / "stage1_test05"
+    final1 = torch.load(s1 / "final.pt", weights_only=False)
+    assert final1["stage"] == 1 and "lora" not in final1 and final1["hidden"] == 16
+    assert final1["epochs"] == 1 and final1["threshold"] == 0.5
+    m1 = json.loads((s1 / "metrics.json").read_text())
+    assert [h["epoch"] for h in m1["history"]] == [1]
+    assert set(m1["history"][0]["train_loss"]) == {"string", "total"}
+    assert set(m1["test"]["frame"]) == {"0.5"} and "validation" not in m1
+    assert set(json.loads((s1 / "eval.json").read_text())["test"]) == {"fixed"}
     assert (s1 / "test_notes.npz").exists() and not (s1 / "kong_cache").exists()
+    with np.load(s1 / "test_notes.npz") as z:                 # test player only
+        assert {k.split("_")[0] for k in z.files} == {"05"}
 
-    # Stage 2: LoRA'd Kong, head from stage 1.
+    # Stage 2: LoRA'd Kong, head from stage 1's final model.
     run(parse_args(base + ["--stage", "2", "--epochs", "1"]), log=quiet)
-    run_dir = out_dir / "stage2_val04_test05"
+    run_dir = out_dir / "stage2_test05"
     hist = json.loads((run_dir / "metrics.json").read_text())["history"]
-    assert [h["epoch"] for h in hist] == [0, 1]
-    assert {"onset", "offset", "frame", "string", "total"} <= set(hist[1]["train_loss"])
-    assert {"total", "string"} <= set(hist[1]["val_loss"])
-    # Epoch 0 of stage 2 is stage 1's best head with Kong unchanged.
-    assert hist[0]["val_tab_f1"] == pytest.approx(
-        json.loads((s1 / "metrics.json").read_text())["history"][best1["best_epoch"]]["val_tab_f1"])
-    best = torch.load(run_dir / "best.pt", weights_only=False)
-    assert best["stage"] == 2 and best["lora"] and best["args"]["lam"] == 0.2
+    assert [h["epoch"] for h in hist] == [1]
+    assert {"onset", "offset", "frame", "string", "total"} <= set(hist[0]["train_loss"])
+    final = torch.load(run_dir / "final.pt", weights_only=False)
+    assert final["stage"] == 2 and final["lora"] and final["args"]["lam"] == 0.2
     ev = json.loads((run_dir / "eval.json").read_text())
-    assert "chosen" in ev["test"] and (run_dir / "test_notes.npz").exists()
+    assert "fixed" in ev["test"] and (run_dir / "test_notes.npz").exists()
     assert not (run_dir / "kong_cache").exists()            # removed unless --keep_cache
     last = torch.load(run_dir / "last.pt", weights_only=False)
     trained_b = [v for k, v in last["state"]["lora"].items() if k.endswith(".B")]
@@ -225,12 +226,13 @@ def test_stage1_then_stage2_end_to_end_and_resume(tmp_path):
     (run_dir / "eval.json").unlink()                          # as if interrupted after epoch 1
     run(parse_args(stage2), log=quiet)
     hist = json.loads((run_dir / "metrics.json").read_text())["history"]
-    assert [h["epoch"] for h in hist] == [0, 1, 2]
+    assert [h["epoch"] for h in hist] == [1, 2]
 
 
 def test_parse_args_stage_defaults():
     a1 = parse_args(["--stage", "1"])
     a2 = parse_args(["--stage", "2", "--lr", "3e-4", "--test_player", "5"])
-    assert (a1.lr, a1.weight_decay, a1.epochs, a1.tag) == (1e-3, 1e-4, 50, "stage1")
-    assert (a2.lr, a2.weight_decay, a2.epochs, a2.tag) == (3e-4, 0.0, 40, "stage2")
+    assert (a1.lr, a1.weight_decay, a1.epochs, a1.tag) == (1e-3, 1e-4, 30, "stage1")
+    assert (a2.lr, a2.weight_decay, a2.epochs, a2.tag) == (3e-4, 0.0, 20, "stage2")
+    assert not hasattr(a1, "val_player") and not hasattr(a1, "patience")
     assert a2.test_player == "05"

@@ -79,16 +79,14 @@ def test_run_end_to_end(tmp_path):
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     torch.save({"args": {"root": str(root), "cache_dir": str(cache),
-                         "val_player": "04", "test_player": "05"}}, run_dir / "best.pt")
-    res = run(run_dir, workers=1, sounds=[0.5], min_frames=[5], log=lambda *_: None)
-    assert set(res["sweep_validation"]) == {
-        "sound=argmax,min_frames=1", "sound=argmax,min_frames=5",
-        "sound=0.5,min_frames=1", "sound=0.5,min_frames=5"}
-    # min_frames 5 drops the 3-frame note, so a min_frames-1 setting wins.
-    assert res["thresholds"]["chosen"]["min_frames"] == 1
-    assert res["test"]["chosen"]["tab_onset"]["pooled"]["f1"] == 1.0
-    assert res["test"]["default"]["tab_onset"]["pooled"]["f1"] == 1.0
+                         "test_player": "05"}}, run_dir / "final.pt")
+    res = run(run_dir, workers=1, log=lambda *_: None)
+    assert set(res["test"]) == {"fixed", "argmax"}
+    assert res["thresholds"]["fixed"] == {"sound": 0.5, "min_frames": 1}
+    assert res["test"]["fixed"]["tab_onset"]["pooled"]["f1"] == 1.0
+    assert res["test"]["argmax"]["tab_onset"]["pooled"]["f1"] == 1.0
     saved = json.loads((run_dir / "eval.json").read_text())
-    assert saved["thresholds"]["default"] == {"sound": None, "min_frames": 1}
+    assert saved["thresholds"]["argmax"] == {"sound": None, "min_frames": 1}
+    assert "validation" not in saved
     with np.load(run_dir / "test_notes.npz") as z:
         np.testing.assert_allclose(z["05_Test0-100-C_comp__est"], REF, atol=1e-6)

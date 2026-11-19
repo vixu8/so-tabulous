@@ -72,7 +72,7 @@ def root(tmp_path):
 
 @pytest.fixture
 def splits(root):
-    return load_split(root, "04", "05")
+    return load_split(root, "05")
 
 
 def kong_available():
@@ -86,22 +86,20 @@ def kong_available():
 # ----- splits -----
 
 def test_load_split_by_player(splits):
-    assert sorted(set(splits["train"].player_id)) == ["00", "01", "02", "03"]
-    assert set(splits["validation"].player_id) == {"04"}
+    assert sorted(set(splits["train"].player_id)) == ["00", "01", "02", "03", "04"]
     assert set(splits["test"].player_id) == {"05"}
-    assert [len(splits[k]) for k in ("train", "validation", "test")] == [8, 2, 2]
+    assert set(splits) == {"train", "test"}
+    assert [len(splits[k]) for k in ("train", "test")] == [10, 2]
 
 
 def test_load_split_ignores_baked_in_split_and_accepts_ints(root):
-    s = load_split(root, 0, 1)  # every row says split=train in the manifest
-    assert set(s["validation"].player_id) == {"00"} and set(s["test"].player_id) == {"01"}
+    s = load_split(root, 1)  # every row says split=train in the manifest
+    assert set(s["test"].player_id) == {"01"} and "01" not in set(s["train"].player_id)
 
 
 def test_load_split_rejects_bad_players(root):
     with pytest.raises(ValueError):
-        load_split(root, "04", "04")
-    with pytest.raises(ValueError):
-        load_split(root, "04", "09")
+        load_split(root, "09")
 
 
 # ----- target helpers -----
@@ -154,7 +152,7 @@ def test_string_per_pitch_unison_keeps_lower_string():
 
 def test_random_item_shapes(splits, root):
     ds = GuitarSetDataset(splits["train"], root, mode="random")
-    assert len(ds) == 8
+    assert len(ds) == 10
     item = ds[0]
     assert item["waveform"].shape == (SEGMENT_SAMPLES,) and item["waveform"].dtype == np.float32
     assert item["tab"].shape == (N_FRAMES, 6) and item["tab_onset"].dtype == bool
@@ -164,7 +162,7 @@ def test_random_item_shapes(splits, root):
 
 def test_random_crops_reproducible_and_per_clip_count(splits, root):
     ds = GuitarSetDataset(splits["train"], root, mode="random", crops_per_clip=3)
-    assert len(ds) == 24
+    assert len(ds) == 30
     torch.manual_seed(0)
     a = [ds[i]["start_s"] for i in range(5)]
     torch.manual_seed(0)
@@ -187,7 +185,7 @@ def test_random_crop_audio_and_labels_line_up(splits, root):
 
 
 def test_windows_cover_clip_and_pad_last(splits, root):
-    ds = GuitarSetDataset(splits["validation"], root, mode="windows")
+    ds = GuitarSetDataset(splits["test"], root, mode="windows")
     assert len(ds) == 2 * 3  # 25 s -> windows at 0, 10, 20
     items = [ds[i] for i in range(3)]
     assert [it["start_s"] for it in items] == [0.0, 10.0, 20.0]
@@ -198,7 +196,7 @@ def test_windows_cover_clip_and_pad_last(splits, root):
 
 
 def test_tokens_match_tokenizer(splits, root):
-    ds = GuitarSetDataset(splits["validation"], root, mode="windows", targets=("tokens",))
+    ds = GuitarSetDataset(splits["test"], root, mode="windows", targets=("tokens",))
     tok = TabTokenizer()
     for i in range(3):
         item = ds[i]
@@ -206,7 +204,7 @@ def test_tokens_match_tokenizer(splits, root):
 
 
 def test_collate(splits, root):
-    ds = GuitarSetDataset(splits["validation"], root, mode="windows",
+    ds = GuitarSetDataset(splits["test"], root, mode="windows",
                           targets=("tokens", "string_per_pitch"))
     batch = collate([ds[0], ds[2]])
     assert batch["waveform"].shape == (2, SEGMENT_SAMPLES) and batch["waveform"].dtype == torch.float32
@@ -241,7 +239,7 @@ def test_kong_targets(splits, root):
     ok, reason = kong_available()
     if not ok:
         pytest.skip(reason)
-    ds = GuitarSetDataset(splits["validation"], root, mode="windows", targets=("kong",))
+    ds = GuitarSetDataset(splits["test"], root, mode="windows", targets=("kong",))
     first, second = ds[0], ds[1]
     for key in KONG_ROLLS:
         assert first[key].shape == (N_FRAMES, 88) and first[key].dtype == np.float32

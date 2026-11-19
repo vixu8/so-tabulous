@@ -1,10 +1,9 @@
 """Head A note-level evaluation: per-frame fret classes -> notes -> metrics.
 
-    python src/headA/eval_head_a.py --run_dir runs/head_a/stage1_val04_test05
+    python src/headA/eval_head_a.py --run_dir runs/head_a/stage1_test05
 
-Reads best.pt from train_head_a.py (its saved args give the data root, the
-probability cache and the players) and, for every clip of the validation and
-test players:
+Reads final.pt from train_head_a.py (its saved args give the data root, the
+probability cache and the test player) and, for every clip of the test player:
   1. stitches the cached 10 s windows of class probabilities back into the whole
      clip (1000 frames per window, n_valid in the last one; same as Head C),
   2. turns them into a tab grid (head_a.predict_tab_grid: argmax, or "a string
@@ -16,13 +15,14 @@ test players:
   4. scores Note F1 / Tab F1 / playability with src/metrics/tab_metrics.py
      (the same metrics and players as Head C and the decoder).
 
-The sounding threshold and min_frames are swept on the validation player and
-picked by pooled onset Tab F1. The test player is scored once with that setting
-and once with the plain argmax at min_frames 1 (the `default`, Head A's own
-predict), for reference.
+There is no validation player (team convention, same as TabCNN), so the setting
+is fixed in advance: a string sounds when 1 - p(silent) >= 0.5, min_frames 1
+(`fixed`, the headline number). The plain argmax at min_frames 1 (`argmax`,
+Head A's own predict) is scored too, for reference only: after little training
+argmax is almost all silence.
 
 Writes eval.json and test_notes.npz into --run_dir. The cache
-(<run_dir>/probs_cache) is built by train_head_a.py from the run's best model and
+(<run_dir>/probs_cache) is built by train_head_a.py from the run's final model and
 deleted afterwards unless --keep_cache; keep it to re-run this script.
 """
 
@@ -50,9 +50,9 @@ from tab_metrics import aggregate, note_metrics, playability, tab_grid_to_notes 
 
 FRAMES_PER_SECOND = 100
 FRAMES_PER_WINDOW = 1000            # frame 1000 of a window = frame 0 of the next
-SOUND_THRESHOLDS = [None, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]   # None = argmax
-MIN_FRAMES = [1, 3, 5]
-DEFAULT = (None, 1)                 # KongHeadA.predict, every run kept
+FIXED = (0.5, 1)                    # (sounding threshold, min_frames): the headline setting
+ARGMAX = (None, 1)                  # KongHeadA.predict, every run kept (reference)
+SETTINGS = {"fixed": FIXED, "argmax": ARGMAX}
 
 
 def setting_key(setting):
@@ -116,7 +116,7 @@ def make_pool(workers):
     return mp.get_context("spawn").Pool(workers) if workers > 1 else None
 
 
-def score_clips(clips, refs, sounds=SOUND_THRESHOLDS, min_frames=MIN_FRAMES, pool=None,
+def score_clips(clips, refs, sounds=(FIXED[0], ARGMAX[0]), min_frames=(1,), pool=None,
                 log=print):
     """Score whole clips for every (sound threshold, min_frames) setting.
 
@@ -131,10 +131,6 @@ def score_clips(clips, refs, sounds=SOUND_THRESHOLDS, min_frames=MIN_FRAMES, poo
     summary = {k: aggregate([res[k]["metrics"] for _, res in done]) for k in settings}
     notes = {k: {t: res[k]["est"] for t, res in done} for k in settings}
     return summary, notes
-
-
-def best_setting(summary):
-    return max(summary, key=lambda k: summary[k]["tab_onset"]["pooled"]["f1"])
 
 
 def evaluate_split(rows, root, cache_dir, sounds, min_frames, workers, log=print):
@@ -159,58 +155,34 @@ def _row(name, agg):
             f"   {g('tab_offset'):.3f}    {agg['playability']['pooled']['rate']:.3f}")
 
 
-def run(run_dir, workers=None, sounds=SOUND_THRESHOLDS, min_frames=MIN_FRAMES, log=print):
+def run(run_dir, workers=None, log=print):
     run_dir = Path(run_dir)
-    args = torch.load(run_dir / "best.pt", map_location="cpu", weights_only=False)["args"]
+    args = torch.load(run_dir / "final.pt", map_location="cpu", weights_only=False)["args"]
     workers = max(1, (os.cpu_count() or 2) - 1) if workers is None else workers
-    splits = load_split(args["root"], args["val_player"], args["test_player"])
-    sounds = [None] + sorted({s for s in sounds if s is not None})
-    min_frames = sorted(set(min_frames) | {DEFAULT[1]})
+    splits = load_split(args["root"], args["test_player"])
+    sounds = sorted({v[0] for v in SETTINGS.values()}, key=lambda x: -1 if x is None else x)
+    min_frames = sorted({v[1] for v in SETTINGS.values()})
 
-    log(f"validation player {args['val_player']}: sweeping {len(sounds)} sounding thresholds "
-        f"x {len(min_frames)} min_frames")
-    val, _, _ = evaluate_split(splits["validation"], args["root"], args["cache_dir"],
-                               sounds, min_frames, workers, log)
-    sweep = {setting_key(k): {"note_onset_f1": a["note_onset"]["pooled"]["f1"],
-                              "tab_onset_f1": a["tab_onset"]["pooled"]["f1"],
-                              "playability": a["playability"]["pooled"]["rate"]}
-             for k, a in val.items()}
-    best = best_setting(val)
-    log("val pooled onset Tab F1 (rows: sounding threshold, columns: min_frames)")
-    log("          " + "".join(f"{m:>8}" for m in min_frames))
-    for s in sounds:
-        log(f"  {'argmax' if s is None else s:<8}"
-            + "".join(f"{val[(s, m)]['tab_onset']['pooled']['f1']:8.3f}" for m in min_frames))
-    log(f"chosen: {setting_key(best)} (default {setting_key(DEFAULT)})")
-
-    log(f"test player {args['test_player']}")
-    test_sounds = [s for s in sounds if s in {best[0], DEFAULT[0]}]
-    test_min = sorted({best[1], DEFAULT[1]})
+    log(f"test player {args['test_player']}: fixed {setting_key(FIXED)}, "
+        f"reference {setting_key(ARGMAX)}")
     test, test_notes, refs = evaluate_split(splits["test"], args["root"], args["cache_dir"],
-                                            test_sounds, test_min, workers, log)
-
+                                            sounds, min_frames, workers, log)
     results = {
-        "thresholds": {"chosen": {"sound": best[0], "min_frames": best[1]},
-                       "default": {"sound": DEFAULT[0], "min_frames": DEFAULT[1]}},
-        "selection": "pooled tab_onset F1 on the validation player",
-        "sweep_validation": sweep,
-        "validation": {"chosen": val[best], "default": val[DEFAULT]},
-        "test": {"chosen": test[best], "default": test[DEFAULT]},
+        "thresholds": {name: {"sound": v[0], "min_frames": v[1]} for name, v in SETTINGS.items()},
+        "selection": "fixed in advance (no validation player)",
+        "test": {name: test[v] for name, v in SETTINGS.items()},
         "run_args": args,
     }
     (run_dir / "eval.json").write_text(json.dumps(results, indent=2))
     np.savez(run_dir / "test_notes.npz",
-             **{f"{t}__est": n for t, n in test_notes[best].items()},
+             **{f"{t}__est": n for t, n in test_notes[FIXED].items()},
              **{f"{t}__ref": n for t, n in refs.items()})
 
     log("\n" + f"{'pooled F1 / playability':<28} note    note+off  tab     tab+off  playable")
-    log(_row("val  @ chosen", val[best]))
-    log(_row("val  @ default", val[DEFAULT]))
-    log(_row("test @ chosen", test[best]))
-    log(_row("test @ default", test[DEFAULT]))
-    mean = test[best]
-    log(f"test @ chosen, mean over clips: note F1 {mean['note_onset']['mean_f1']:.3f}, "
-        f"tab F1 {mean['tab_onset']['mean_f1']:.3f}")
+    log(_row("test @ fixed", test[FIXED]))
+    log(_row("test @ argmax", test[ARGMAX]))
+    log(f"test @ fixed, mean over clips: note F1 {test[FIXED]['note_onset']['mean_f1']:.3f}, "
+        f"tab F1 {test[FIXED]['tab_onset']['mean_f1']:.3f}")
     log(f"saved {run_dir / 'eval.json'} and test_notes.npz")
     return results
 
@@ -218,14 +190,10 @@ def run(run_dir, workers=None, sounds=SOUND_THRESHOLDS, min_frames=MIN_FRAMES, l
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--run_dir", required=True,
-                   help="folder with best.pt (and probs_cache/) from train_head_a.py --keep_cache")
+                   help="folder with final.pt (and probs_cache/) from train_head_a.py --keep_cache")
     p.add_argument("--workers", type=int, default=None, help="default: CPU count - 1")
-    p.add_argument("--sound_thresholds", type=float, nargs="+",
-                   default=[s for s in SOUND_THRESHOLDS if s is not None],
-                   help="argmax is always included")
-    p.add_argument("--min_frames", type=int, nargs="+", default=MIN_FRAMES)
     a = p.parse_args()
-    run(a.run_dir, a.workers, a.sound_thresholds, a.min_frames)
+    run(a.run_dir, a.workers)
 
 
 if __name__ == "__main__":

@@ -1,40 +1,37 @@
-"""Head A trainer, both stages, on one leave-one-player-out fold.
+"""Head A trainer, both stages, on one leave-one-player-out fold (5 train players + 1 test).
 
-    python src/headA/train_head_a.py --stage 1 --val_player 04 --test_player 05
-    python src/headA/train_head_a.py --stage 2 --val_player 04 --test_player 05
+    python src/headA/train_head_a.py --stage 1 --test_player 05
+    python src/headA/train_head_a.py --stage 2 --test_player 05
 
 Model: Kong (TunableKongEncoder) + the fusion adapter -> `features` -> TabCNN's
 dense head -> 21 classes per string per frame (src/headA/head_a.py).
 
+There is no validation player (team convention, same as TabCNN): each stage trains
+for a fixed number of epochs and keeps the last one; the sounding threshold is
+fixed in advance (0.5), never picked on the test player.
+
 Stage 1: Kong frozen (run live on random 10 s crops); the adapter and a fresh head
-train. Defaults: AdamW lr 1e-3, weight decay 1e-4, <= 50 epochs.
+train. Defaults: AdamW lr 1e-3, weight decay 1e-4, 30 epochs.
 
 Stage 2: starts from the fold's stage 1 adapter + head
-(<out_dir>/stage1_val{V}_test{T}/best.pt) and a fresh rank-8 LoRA on every Kong
+(<out_dir>/stage1_test{T}/final.pt) and a fresh rank-8 LoRA on every Kong
 Linear / GRU weight (src/kong_wrapper/lora.py). Kong runs with dropout on and
 BatchNorm frozen; the adapter and head train fully. Defaults: lr 1e-4, no weight
-decay, <= 40 epochs.
+decay, 20 epochs.
 
 Loss (both stages): the tab loss (6 x cross-entropy over the 21 classes, padded
 frames ignored). No Kong loss: Head A reads `features`, not Kong's piano outputs.
 
-Both stages work like Head C's trainer (src/headC/train_head_c.py): every epoch is
-scored on the validation player at note level (eval_head_a: frame runs -> notes ->
-Tab F1, best over the sounding-threshold x min_frames grid); the best epoch by
-validation Tab F1 is kept (early stopping, patience 5), with the validation loss
-logged alongside. Epoch 0 is the starting point.
+After training, the final model's class probabilities for the test player are
+cached in the run folder (float16), frame-level metrics are computed on them
+(sounding threshold 0.5, plus argmax; comparable with TabCNN), and eval_head_a.run
+scores them at note level. The cache is deleted unless --keep_cache.
 
-After training, the best model's class probabilities for the validation and test
-players are cached in the run folder (float16), frame-level metrics are computed on
-them (sounding threshold picked on validation by frame Tab F1; comparable with
-TabCNN), and eval_head_a.run scores them at note level. The cache is deleted unless
---keep_cache.
-
-For AWS / long runs: everything is logged to <run_dir>/train.log; <run_dir>/last.pt
+For EC2 / long runs: everything is logged to <run_dir>/train.log; <run_dir>/last.pt
 is saved every epoch, and --resume continues from it (a finished run, one with
 eval.json, is skipped).
 
-Writes <out_dir>/<tag>_val{V}_test{T}/ (tag defaults to stage1 / stage2): best.pt
+Writes <out_dir>/<tag>_test{T}/ (tag defaults to stage1 / stage2): final.pt
 (adapter + head [+ LoRA A/B] + config), last.pt, metrics.json, eval.json,
 test_notes.npz, train.log.
 """
@@ -67,8 +64,9 @@ from tab_metrics import frame_metrics  # noqa: E402
 
 REPO = HERE.parents[1]
 DEFAULT_KONG_REPO = HERE.parent / "kong_wrapper" / "third_party" / "piano_transcription"
-STAGE_DEFAULTS = {1: {"lr": 1e-3, "weight_decay": 1e-4, "epochs": 50},
-                  2: {"lr": 1e-4, "weight_decay": 0.0, "epochs": 40}}
+STAGE_DEFAULTS = {1: {"lr": 1e-3, "weight_decay": 1e-4, "epochs": 30},
+                  2: {"lr": 1e-4, "weight_decay": 0.0, "epochs": 20}}
+FRAME_SOUNDS = (ev.FIXED[0], ev.ARGMAX[0])  # frame-level metrics: fixed 0.5, plus argmax
 
 
 # ----- model -----
@@ -85,7 +83,7 @@ def pick_device(name):
 
 def stage1_dir(args):
     return Path(args.stage1_dir or Path(args.out_dir)
-                / f"stage1_val{args.val_player}_test{args.test_player}")
+                / f"stage1_test{args.test_player}")
 
 
 def build_model(args, device):
@@ -97,7 +95,7 @@ def build_model(args, device):
     if args.stage == 1:
         model.set_stage(1)
         return model.to(device)
-    stage1 = torch.load(stage1_dir(args) / "best.pt", map_location="cpu", weights_only=False)
+    stage1 = torch.load(stage1_dir(args) / "final.pt", map_location="cpu", weights_only=False)
     model.encoder.fusion_adapter.load_state_dict(stage1["adapter"])
     model.head.load_state_dict(stage1["head"])
     model.set_stage(2, rank=args.rank, alpha=args.alpha)
@@ -149,26 +147,6 @@ def clip_windows(model, row, root, device):
     return b, model(b["waveform"])
 
 
-@torch.no_grad()
-def validate(model, rows, root, refs, device, pool):
-    """Validation loss + note-level Tab F1 (best setting) with Kong running live."""
-    model.eval()
-    loss_sum, n_windows, clips = 0.0, 0, {}
-    for row in rows.itertuples(index=False):
-        b, logits = clip_windows(model, row, root, device)
-        loss_sum += loss_fn(logits, b)[0].item() * len(logits)
-        n_windows += len(logits)
-        probs = logits.float().softmax(-1).cpu().numpy()
-        clips[row.track_id] = ev.stitch_windows(probs, b["n_valid_frames"].cpu().numpy())
-    summary, _ = ev.score_clips(clips, refs, pool=pool, log=lambda *_: None)
-    best = ev.best_setting(summary)
-    return {"loss": {"tab": loss_sum / n_windows, "total": loss_sum / n_windows},
-            "tab_f1": summary[best]["tab_onset"]["pooled"]["f1"],
-            "note_f1": summary[best]["note_onset"]["pooled"]["f1"],
-            "playability": summary[best]["playability"]["pooled"]["rate"],
-            "setting": ev.setting_key(best)}
-
-
 class Logger:
     def __init__(self, path):
         self.path = Path(path)
@@ -182,7 +160,7 @@ class Logger:
 
 def run(args, log=None):
     device = pick_device(args.device)
-    run_dir = Path(args.out_dir) / f"{args.tag}_val{args.val_player}_test{args.test_player}"
+    run_dir = Path(args.out_dir) / f"{args.tag}_test{args.test_player}"
     run_dir.mkdir(parents=True, exist_ok=True)
     log = log or Logger(run_dir / "train.log")
     if args.resume and (run_dir / "eval.json").exists():
@@ -195,8 +173,7 @@ def run(args, log=None):
               else f"stage 1 adapter + head from {stage1_dir(args)}")
     log(f"stage {args.stage}; device {device}; run {run_dir}; {source}")
     torch.manual_seed(args.seed)
-    splits = load_split(args.root, args.val_player, args.test_player)
-    val_refs = ev.reference_notes(args.root, splits["validation"])
+    splits = load_split(args.root, args.test_player)
     train_ds = GuitarSetDataset(splits["train"], args.root, mode="random",
                                 crops_per_clip=args.crops_per_clip)
     loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate,
@@ -208,70 +185,39 @@ def run(args, log=None):
         f"{len(train_ds)} per epoch ({len(loader)} steps); LoRA {n_lora:,} + adapter "
         f"{sum(p.numel() for p in model.encoder.fusion_adapter.parameters()):,} + head "
         f"{sum(p.numel() for p in model.head.parameters()):,} trainable; lr {args.lr}, "
-        f"weight decay {args.weight_decay}, <= {args.epochs} epochs")
+        f"weight decay {args.weight_decay}, {args.epochs} epochs (last one kept)")
 
-    history, best_f1, best_epoch, bad, start = [], -1.0, 0, 0, 0
-    best_state = None
+    history, start = [], 1
     last_path = run_dir / "last.pt"
     if args.resume and last_path.exists():
         last = torch.load(last_path, map_location="cpu", weights_only=False)
         restore(model, last["state"])
         opt.load_state_dict(last["optimizer"])
         torch.set_rng_state(last["torch_rng"])
-        history, best_f1, best_epoch, bad = (last["history"], last["best_f1"],
-                                             last["best_epoch"], last["bad"])
-        best_state, start = last["best_state"], last["epoch"] + 1
-        log(f"resumed after epoch {last['epoch']} (best {best_epoch}: Tab F1 {best_f1:.4f})")
+        history, start = last["history"], last["epoch"] + 1
+        log(f"resumed after epoch {last['epoch']}")
 
-    pool = ev.make_pool(args.workers)
-    try:
-        for epoch in range(start, args.epochs + 1):
-            if epoch > 0 and bad >= args.patience:
-                break
-            t0 = time.time()
-            train_parts = {}
-            if epoch > 0:                      # epoch 0 = starting point, no training
-                model.train()
-                sums, steps = defaultdict(float), 0
-                for batch in loader:
-                    b = batch_to(batch, device)
-                    total, parts = loss_fn(model(b["waveform"]), b)
-                    opt.zero_grad(set_to_none=True)
-                    total.backward()
-                    opt.step()
-                    for k, v in {**parts, "total": total}.items():
-                        sums[k] += v.item()
-                    steps += 1
-                train_parts = {k: v / steps for k, v in sums.items()}
-            t_train = time.time() - t0
-            val = validate(model, splits["validation"], args.root, val_refs, device, pool)
-            entry = {"epoch": epoch, "train_loss": train_parts, "val_loss": val["loss"],
-                     "val_tab_f1": val["tab_f1"], "val_note_f1": val["note_f1"],
-                     "val_playability": val["playability"], "val_setting": val["setting"],
-                     "seconds_train": t_train, "seconds_total": time.time() - t0}
-            history.append(entry)
-            if val["tab_f1"] > best_f1:
-                best_f1, best_epoch, bad, best_state = val["tab_f1"], epoch, 0, snapshot(model)
-            elif epoch > 0:
-                bad += 1
-            log(f"epoch {epoch:3d} | train {train_parts.get('total', float('nan')):.4f} | val loss "
-                f"{val['loss']['total']:.4f} | val note F1 {val['note_f1']:.4f} tab F1 "
-                f"{val['tab_f1']:.4f} @ {val['setting']} | "
-                f"{t_train:.0f}+{entry['seconds_total'] - t_train:.0f} s"
-                + ("  *best*" if best_epoch == epoch else ""))
-            torch.save({"epoch": epoch, "state": snapshot(model), "optimizer": opt.state_dict(),
-                        "torch_rng": torch.get_rng_state(), "history": history,
-                        "best_f1": best_f1, "best_epoch": best_epoch, "bad": bad,
-                        "best_state": best_state}, last_path)
-        if bad >= args.patience:
-            log(f"early stop: no val Tab F1 improvement for {args.patience} epochs")
-    finally:
-        if pool:
-            pool.close()
-            pool.join()
-    log(f"best epoch {best_epoch} (val Tab F1 {best_f1:.4f})")
-    restore(model, best_state)
-    return finish(args, model, run_dir, best_epoch, history, device, log)
+    for epoch in range(start, args.epochs + 1):
+        t0 = time.time()
+        model.train()
+        sums, steps = defaultdict(float), 0
+        for batch in loader:
+            b = batch_to(batch, device)
+            total, parts = loss_fn(model(b["waveform"]), b)
+            opt.zero_grad(set_to_none=True)
+            total.backward()
+            opt.step()
+            for k, v in {**parts, "total": total}.items():
+                sums[k] += v.item()
+            steps += 1
+        train_parts = {k: v / max(steps, 1) for k, v in sums.items()}
+        history.append({"epoch": epoch, "train_loss": train_parts,
+                        "seconds": time.time() - t0})
+        log(f"epoch {epoch:3d}/{args.epochs} | train {train_parts.get('total', float('nan')):.4f}"
+            f" | {history[-1]['seconds']:.0f} s")
+        torch.save({"epoch": epoch, "state": snapshot(model), "optimizer": opt.state_dict(),
+                    "torch_rng": torch.get_rng_state(), "history": history}, last_path)
+    return finish(args, model, run_dir, history, device, log)
 
 
 # ----- after training: cache, frame-level metrics, note-level eval -----
@@ -318,36 +264,30 @@ def _summary(name, res, key):
             f"{fm['tab']['precision']:.3f}/{fm['tab']['recall']:.3f}/{fm['tab']['f1']:.3f}")
 
 
-def finish(args, model, run_dir, best_epoch, history, device, log):
-    """Cache the best model's probabilities for val/test, then score them (frame + note level)."""
-    splits = load_split(args.root, args.val_player, args.test_player)
+def finish(args, model, run_dir, history, device, log):
+    """Cache the final model's probabilities for the test player, then score them."""
+    splits = load_split(args.root, args.test_player)
     cache_dir = run_dir / "probs_cache"
     if cache_dir.exists():
-        shutil.rmtree(cache_dir)              # always from this run's best state
-    log(f"Caching class probabilities for the validation and test players into {cache_dir} ...")
-    build_probs_cache(model, pd.concat([splits["validation"], splits["test"]]), args.root,
-                      cache_dir, device, log)
-
-    val = {"frame": frame_eval(cache_dir, splits["validation"].track_id, ev.SOUND_THRESHOLDS)}
-    threshold = max(val["frame"], key=lambda k: val["frame"][k]["tab"]["f1"])
-    test_sounds = [s for s in ev.SOUND_THRESHOLDS if sound_name(s) in {threshold, "argmax"}]
-    test = {"frame": frame_eval(cache_dir, splits["test"].track_id, test_sounds)}
+        shutil.rmtree(cache_dir)              # always from this run's final state
+    log(f"Caching class probabilities for the test player into {cache_dir} ...")
+    build_probs_cache(model, splits["test"], args.root, cache_dir, device, log)
+    threshold = sound_name(ev.FIXED[0])
+    test = {"frame": frame_eval(cache_dir, splits["test"].track_id, FRAME_SOUNDS)}
 
     config = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}
     config["cache_dir"] = str(cache_dir)       # eval_head_a reads probabilities from here
     state = snapshot(model)
     ckpt = {"adapter": state["adapter"], "head": state["head"], "threshold": threshold,
-            "best_epoch": best_epoch, "args": config, "stage": args.stage}
+            "epochs": args.epochs, "args": config, "stage": args.stage}
     if args.stage == 2:
         ckpt.update(lora=state["lora"], lora_config={"rank": args.rank, "alpha": args.alpha})
-    torch.save(ckpt, run_dir / "best.pt")
+    torch.save(ckpt, run_dir / "final.pt")
     (run_dir / "metrics.json").write_text(json.dumps(
-        {"stage": args.stage, "best_epoch": best_epoch, "threshold": threshold,
-         "history": history, "validation": val, "test": test, "args": config}, indent=2))
-    log("val frame tab F1 by sounding threshold: " + ", ".join(
-        f"{k}: {v['tab']['f1']:.3f}" for k, v in val["frame"].items()) + f" -> {threshold}")
-    log(_summary("validation", val["frame"], threshold))
+        {"stage": args.stage, "epochs": args.epochs, "threshold": threshold,
+         "history": history, "test": test, "args": config}, indent=2))
     log(_summary("test", test["frame"], threshold))
+    log(_summary("test", test["frame"], "argmax"))
 
     results = ev.run(run_dir, args.workers, log=log)
     if not args.keep_cache:
@@ -359,13 +299,12 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--stage", type=int, choices=(1, 2), required=True)
     p.add_argument("--root", default=str(REPO / "features" / "v1"))
-    p.add_argument("--val_player", default="04")
     p.add_argument("--test_player", default="05")
     p.add_argument("--tag", default=None, help="run folder prefix (default stage1 / stage2)")
     p.add_argument("--out_dir", default=str(REPO / "runs" / "head_a"))
     p.add_argument("--stage1_dir", default=None,
-                   help="stage 2: folder with stage 1's best.pt (default "
-                        "<out_dir>/stage1_val{V}_test{T})")
+                   help="stage 2: folder with stage 1's final.pt (default "
+                        "<out_dir>/stage1_test{T})")
     p.add_argument("--checkpoint",
                    default=str(REPO / "src" / "kong_wrapper" / "checkpoints" / "kong_note_pedal.pth"))
     p.add_argument("--kong_repo", default=str(DEFAULT_KONG_REPO))
@@ -374,10 +313,9 @@ def parse_args(argv=None):
     p.add_argument("--lr", type=float, default=None, help="default: 1e-3 stage 1, 1e-4 stage 2")
     p.add_argument("--weight_decay", type=float, default=None,
                    help="default: 1e-4 stage 1, 0 stage 2")
-    p.add_argument("--epochs", type=int, default=None, help="default: 50 stage 1, 40 stage 2")
+    p.add_argument("--epochs", type=int, default=None, help="default: 30 stage 1, 20 stage 2")
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--crops_per_clip", type=int, default=2, help="random 10 s crops per clip per epoch")
-    p.add_argument("--patience", type=int, default=5)
     p.add_argument("--num_workers", type=int, default=4, help="DataLoader workers")
     p.add_argument("--workers", type=int, default=None,
                    help="note-scoring processes (default: CPU count - 1)")
@@ -386,7 +324,7 @@ def parse_args(argv=None):
     p.add_argument("--resume", action="store_true", help="continue from <run_dir>/last.pt")
     p.add_argument("--keep_cache", action="store_true", help="keep <run_dir>/probs_cache")
     args = p.parse_args(argv)
-    args.val_player, args.test_player = args.val_player.zfill(2), args.test_player.zfill(2)
+    args.test_player = args.test_player.zfill(2)
     for k, v in STAGE_DEFAULTS[args.stage].items():
         if getattr(args, k) is None:
             setattr(args, k, v)

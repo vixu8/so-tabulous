@@ -1,10 +1,9 @@
 """Head C note-level evaluation: Kong's post-processor -> notes -> strings -> metrics.
 
-    python src/headC/eval_head_c.py --run_dir runs/head_c/stage1_val04_test05
+    python src/headC/eval_head_c.py --run_dir runs/head_c/stage1_test05
 
-Reads best.pt from train_head_c.py (its saved args give the data root, the Kong
-output cache and the players) and, for every clip of the validation and test
-players:
+Reads final.pt from train_head_c.py (its saved args give the data root, the Kong
+output cache and the test player) and, for every clip of the test player:
   1. stitches the cached 10 s windows back into the whole clip (1000 frames per
      window, n_valid in the last one; same non-overlapping windows as the decoder),
   2. turns Kong's outputs into notes with Kong's own RegressionPostProcessor
@@ -12,15 +11,16 @@ players:
   3. gives each note a string with head_c.assign_strings,
   4. scores Note F1 / Tab F1 / playability with src/metrics/tab_metrics.py.
 
-Kong's onset peaks are weak on guitar (median 0.22 at true onsets), so the onset
-and frame thresholds are swept on the validation player and picked by pooled
-onset Tab F1. The test player is scored once with that pair and once with Kong's
-own defaults (onset 0.3, offset 0.3, frame 0.1), for reference.
+There is no validation player (team convention, same as TabCNN), so nothing is
+tuned: notes use Kong's own default thresholds (onset 0.3, offset 0.3, frame 0.1).
+Kong's onset peaks are weak on guitar (median 0.22 at true onsets), so these
+defaults likely cost some recall; picking other thresholds on the test player
+would leak. score_clips / detect_notes still take threshold lists, for analysis.
 
 Writes eval.json and test_notes.npz into --run_dir.
 
-Kong's outputs come from the run's own cache (<run_dir>/kong_cache, best.pt's
-args.cache_dir), which train_head_c.py builds from the run's best model (frozen
+Kong's outputs come from the run's own cache (<run_dir>/kong_cache, final.pt's
+args.cache_dir), which train_head_c.py builds from the run's final model (frozen
 Kong in stage 1, LoRA'd Kong in stage 2) and deletes afterwards unless
 --keep_cache. To re-run this script later, train with --keep_cache.
 """
@@ -53,8 +53,6 @@ FRAMES_PER_WINDOW = 1000            # frame 1000 of a window = frame 0 of the ne
 GUITAR_PITCHES = slice(19, 63)      # Kong indices of MIDI 40..83
 GUITAR_INDEX_OFFSET = 19            # sliced index i is Kong index i + 19
 KONG_DEFAULTS = {"onset": 0.3, "offset": 0.3, "frame": 0.1}   # pytorch/inference.py
-ONSET_THRESHOLDS = [0.02, 0.05, 0.1, 0.2, 0.3]
-FRAME_THRESHOLDS = [0.01, 0.05, 0.1]
 DEFAULT_KONG_REPO = HERE.parent / "kong_wrapper" / "third_party" / "piano_transcription"
 
 _UTILITIES = {}
@@ -230,76 +228,46 @@ def _row(name, agg):
             f"   {g('tab_offset'):.3f}    {agg['playability']['pooled']['rate']:.3f}")
 
 
-def run(run_dir, kong_repo=DEFAULT_KONG_REPO, workers=None, onset_ts=ONSET_THRESHOLDS,
-        frame_ts=FRAME_THRESHOLDS, log=print):
+def run(run_dir, kong_repo=DEFAULT_KONG_REPO, workers=None, log=print):
     run_dir = Path(run_dir)
-    ckpt = torch.load(run_dir / "best.pt", map_location="cpu", weights_only=False)
+    ckpt = torch.load(run_dir / "final.pt", map_location="cpu", weights_only=False)
     args = ckpt["args"]
     head = HeadC(hidden=ckpt["hidden"], dropout=ckpt["dropout"])
     head.load_state_dict(ckpt["head"])
     workers = max(1, (os.cpu_count() or 2) - 1) if workers is None else workers
-    splits = load_split(args["root"], args["val_player"], args["test_player"])
-    onset_ts = sorted(set(onset_ts) | {KONG_DEFAULTS["onset"]})
-    frame_ts = sorted(set(frame_ts) | {KONG_DEFAULTS["frame"]})
-    default = (KONG_DEFAULTS["onset"], KONG_DEFAULTS["frame"])
+    splits = load_split(args["root"], args["test_player"])
+    fixed = (KONG_DEFAULTS["onset"], KONG_DEFAULTS["frame"])
 
-    log(f"validation player {args['val_player']}: sweeping {len(onset_ts)} onset x "
-        f"{len(frame_ts)} frame thresholds")
-    val, _, _ = evaluate_split(head, splits["validation"], args["root"], args["cache_dir"],
-                               onset_ts, frame_ts, kong_repo, workers, log)
-    sweep = {pair_key(p): {"note_onset_f1": a["note_onset"]["pooled"]["f1"],
-                           "tab_onset_f1": a["tab_onset"]["pooled"]["f1"],
-                           "playability": a["playability"]["pooled"]["rate"]}
-             for p, a in val.items()}
-    best = max(val, key=lambda p: val[p]["tab_onset"]["pooled"]["f1"])
-    log("val pooled onset Tab F1 (rows: onset threshold, columns: frame threshold)")
-    log("          " + "".join(f"{f:>8}" for f in frame_ts))
-    for o in onset_ts:
-        log(f"  {o:<8}" + "".join(f"{val[(o, f)]['tab_onset']['pooled']['f1']:8.3f}"
-                                   for f in frame_ts))
-    log(f"chosen: {pair_key(best)} (Kong default {pair_key(default)})")
-
-    log(f"test player {args['test_player']}")
-    test_pairs_o, test_pairs_f = sorted({best[0], default[0]}), sorted({best[1], default[1]})
+    log(f"test player {args['test_player']}: Kong default thresholds {pair_key(fixed)}")
     test, test_notes, refs = evaluate_split(head, splits["test"], args["root"], args["cache_dir"],
-                                            test_pairs_o, test_pairs_f, kong_repo, workers, log)
-
+                                            [fixed[0]], [fixed[1]], kong_repo, workers, log)
     results = {
-        "thresholds": {"chosen": {"onset": best[0], "frame": best[1],
-                                  "offset": KONG_DEFAULTS["offset"]},
-                       "kong_default": KONG_DEFAULTS},
-        "selection": "pooled tab_onset F1 on the validation player",
-        "sweep_validation": sweep,
-        "validation": {"chosen": val[best], "kong_default": val[default]},
-        "test": {"chosen": test[best], "kong_default": test[default]},
+        "thresholds": {"fixed": KONG_DEFAULTS},
+        "selection": "fixed: Kong's default thresholds (no validation player)",
+        "test": {"fixed": test[fixed]},
         "run_args": args,
     }
     (run_dir / "eval.json").write_text(json.dumps(results, indent=2))
     np.savez(run_dir / "test_notes.npz",
-             **{f"{t}__est": n for t, n in test_notes[best].items()},
+             **{f"{t}__est": n for t, n in test_notes[fixed].items()},
              **{f"{t}__ref": n for t, n in refs.items()})
 
     log("\n" + f"{'pooled F1 / playability':<28} note    note+off  tab     tab+off  playable")
-    log(_row(f"val  @ chosen", val[best]))
-    log(_row(f"val  @ Kong default", val[default]))
-    log(_row(f"test @ chosen", test[best]))
-    log(_row(f"test @ Kong default", test[default]))
-    mean = test[best]
-    log(f"test @ chosen, mean over clips: note F1 {mean['note_onset']['mean_f1']:.3f}, "
-        f"tab F1 {mean['tab_onset']['mean_f1']:.3f}")
+    log(_row("test @ Kong defaults", test[fixed]))
+    log(f"test, mean over clips: note F1 {test[fixed]['note_onset']['mean_f1']:.3f}, "
+        f"tab F1 {test[fixed]['tab_onset']['mean_f1']:.3f}")
     log(f"saved {run_dir / 'eval.json'} and test_notes.npz")
     return results
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--run_dir", required=True, help="folder with best.pt from train_head_c.py")
+    p.add_argument("--run_dir", required=True,
+                   help="folder with final.pt (and kong_cache/) from train_head_c.py --keep_cache")
     p.add_argument("--kong_repo", default=str(DEFAULT_KONG_REPO))
     p.add_argument("--workers", type=int, default=None, help="default: CPU count - 1")
-    p.add_argument("--onset_thresholds", type=float, nargs="+", default=ONSET_THRESHOLDS)
-    p.add_argument("--frame_thresholds", type=float, nargs="+", default=FRAME_THRESHOLDS)
     a = p.parse_args()
-    run(a.run_dir, a.kong_repo, a.workers, a.onset_thresholds, a.frame_thresholds)
+    run(a.run_dir, a.kong_repo, a.workers)
 
 
 if __name__ == "__main__":

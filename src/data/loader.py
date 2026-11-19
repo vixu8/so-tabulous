@@ -3,7 +3,7 @@
 One Dataset for every model (Head A, Head C, the AR decoder): each item is a
 10 s audio crop plus the targets each model needs, all built from the same crop.
 
-    splits = load_split("features/v1", val_player="04", test_player="05")
+    splits = load_split("features/v1", test_player="05")     # train = the other 5 players
     train = GuitarSetDataset(splits["train"], "features/v1", mode="random",
                              targets=("string_per_pitch",))
     loader = DataLoader(train, batch_size=8, shuffle=True, num_workers=4,
@@ -85,23 +85,22 @@ DEFAULT_KONG_REPO = (Path(__file__).resolve().parents[1]
 
 # ----- splits -----
 
-def load_split(root, val_player, test_player):
-    """Manifest rows per split, by player: {"train", "validation", "test"} -> DataFrame."""
+def load_split(root, test_player):
+    """Manifest rows per split, by player: {"train", "test"} -> DataFrame.
+
+    Leave-one-player-out with no validation player (same as TabCNN): the test
+    player's clips are "test", the other 5 players' clips are "train".
+    """
     manifest = pd.read_csv(Path(root) / "manifest.csv", dtype={"player_id": str})
-    val, test = str(val_player).zfill(2), str(test_player).zfill(2)
+    test = str(test_player).zfill(2)
     players = set(manifest.player_id)
-    if val == test:
-        raise ValueError(f"val_player and test_player are both {val!r}")
-    for p in (val, test):
-        if p not in players:
-            raise ValueError(f"player {p!r} not in manifest (players: {sorted(players)})")
+    if test not in players:
+        raise ValueError(f"player {test!r} not in manifest (players: {sorted(players)})")
     splits = {
-        "train": manifest[~manifest.player_id.isin([val, test])],
-        "validation": manifest[manifest.player_id == val],
+        "train": manifest[manifest.player_id != test],
         "test": manifest[manifest.player_id == test],
     }
-    seen = [set(df.player_id) for df in splits.values()]
-    assert not (seen[0] & seen[1] or seen[0] & seen[2] or seen[1] & seen[2]), "player leak"
+    assert not set(splits["train"].player_id) & set(splits["test"].player_id), "player leak"
     return {k: df.reset_index(drop=True) for k, df in splits.items()}
 
 

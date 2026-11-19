@@ -3,7 +3,8 @@ into a Kong-style HDF5 file with extra tab labels.
 
 Pipeline (one pass over all 360 clips):
   1. Download annotations + mono mic audio via mirdata (skippable).
-  2. Assign each clip to train / validation / test by player.
+  2. Assign each clip to train / test by player (the baked-in split is informational:
+     src/data/loader.py's load_split re-splits by player for every fold).
   3. Per clip:
        - notes -> round to semitone -> (string, fret); drop frets outside 0..MAX_FRET
        - truncate the earlier note when two notes overlap on the same string
@@ -12,7 +13,8 @@ Pipeline (one pass over all 360 clips):
   4. Write <out_dir>/hdf5s/<track_id>.h5, <out_dir>/manifest.csv, <out_dir>/stats.json
 
 HDF5 contents (Kong-compatible fields + tab additions):
-  attrs:    split (bytes: train|validation|test), duration, sample_rate,
+  attrs:    split (bytes: train|test, or validation with the legacy --val_player),
+            duration, sample_rate,
             track_id, player_id, style, mode
   waveform:        int16, 16 kHz mono
   midi_event:      bytes strings like "note_on channel=0 note=60 velocity=64 time=0"
@@ -24,8 +26,12 @@ HDF5 contents (Kong-compatible fields + tab additions):
 Velocity is a placeholder (GuitarSet has none): mask the velocity loss in training.
 
 Usage:
-  python src/data/preprocessing.py --val_player 04 --test_player 05
-  python src/data/preprocessing.py --val_player 04 --test_player 05 --skip_download
+  python src/data/preprocessing.py --test_player 05
+  python src/data/preprocessing.py --test_player 05 --skip_download
+
+There is no validation player (team convention, same as TabCNN). --val_player is
+kept only so features/v1, built with --val_player 04 --test_player 05, can be
+reproduced exactly.
 """
 
 # To open one clip:
@@ -33,7 +39,7 @@ Usage:
 # import numpy as np
 
 # with h5py.File("features/v1/hdf5s/00_BN1-129-Eb_comp.h5", "r") as hf:
-#     split = hf.attrs["split"].decode()           # "train" / "validation" / "test"
+#     split = hf.attrs["split"].decode()           # "train" / "test" (v1 also "validation")
 #     sr = int(hf.attrs["sample_rate"])            # 16000
 #     duration = float(hf.attrs["duration"])
 
@@ -63,10 +69,10 @@ PLACEHOLDER_VELOCITY = 64
 PLAYERS = ["00", "01", "02", "03", "04", "05"]
 
 
-def assign_split(player_id, val_player, test_player):
+def assign_split(player_id, test_player, val_player=None):
     if player_id == test_player:
         return "test"
-    if player_id == val_player:
+    if val_player is not None and player_id == val_player:
         return "validation"
     return "train"
 
@@ -185,14 +191,15 @@ def process_track(track, split, hdf5_dir, stats, fret_counts):
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--val_player", required=True, choices=PLAYERS)
+    parser.add_argument("--val_player", default=None, choices=PLAYERS,
+                        help="legacy (features/v1 used 04); default: no validation player")
     parser.add_argument("--test_player", required=True, choices=PLAYERS)
     parser.add_argument("--data_home", default=None,
                         help="where mirdata stores GuitarSet (default: ~/mir_datasets/guitarset)")
     parser.add_argument("--out_dir", default="features/v1")
     parser.add_argument("--skip_download", action="store_true")
     args = parser.parse_args()
-    if args.val_player == args.test_player:
+    if args.val_player is not None and args.val_player == args.test_player:
         parser.error("val_player and test_player must differ")
 
     # --- Stage 0: download only what we need ---
@@ -215,7 +222,7 @@ def main():
 
     for i, track_id in enumerate(sorted(track_ids)):
         track = dataset.track(track_id)
-        split = assign_split(track.player_id, args.val_player, args.test_player)
+        split = assign_split(track.player_id, args.test_player, args.val_player)
         rows.append(process_track(track, split, hdf5_dir, stats, fret_counts))
         if (i + 1) % 30 == 0:
             print(f"  processed {i + 1}/{len(track_ids)}")

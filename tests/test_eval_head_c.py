@@ -136,13 +136,14 @@ def test_run_end_to_end(tmp_path):
     torch.manual_seed(0)
     torch.save({"head": HeadC(hidden=16).state_dict(), "hidden": 16, "dropout": 0.0,
                 "args": {"root": str(root), "cache_dir": str(cache),
-                         "val_player": "04", "test_player": "05"}}, run_dir / "best.pt")
+                         "test_player": "05"}}, run_dir / "final.pt")
 
-    res = run(run_dir, workers=1, onset_ts=[0.1, 0.3], frame_ts=[0.1], log=lambda *_: None)
-    assert set(res["sweep_validation"]) == {"onset=0.1,frame=0.1", "onset=0.3,frame=0.1"}
+    res = run(run_dir, workers=1, log=lambda *_: None)
+    assert set(res["test"]) == {"fixed"} and "validation" not in res
     # The note is detected with the right pitch and timing whatever string the random head picks.
-    assert res["test"]["chosen"]["note_onset"]["pooled"]["f1"] == 1.0
-    assert json.loads((run_dir / "eval.json").read_text())["thresholds"]["chosen"]["frame"] == 0.1
+    assert res["test"]["fixed"]["note_onset"]["pooled"]["f1"] == 1.0
+    assert json.loads((run_dir / "eval.json").read_text())["thresholds"]["fixed"] == {
+        "onset": 0.3, "offset": 0.3, "frame": 0.1}
     with np.load(run_dir / "test_notes.npz") as z:
         est = z["05_Test0-100-C_comp__est"]
         assert est.shape == (1, 4) and est[0, 1] == 52 - [40, 45, 50, 55, 59, 64][int(est[0, 0])]
