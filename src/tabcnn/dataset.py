@@ -68,15 +68,16 @@ def load_ids(data_path: str | Path, id_file: str = "id.csv") -> list[str]:
     return list(pd.read_csv(csv_file, header=None)[0])
 
 
-def partition_ids(list_IDs: list[str], val_split: int) -> dict[str, list[str]]:
-    """Split IDs into train/validation by guitarist, held out on ``val_split``.
+def partition_ids(list_IDs: list[str], test_split: int) -> dict[str, list[str]]:
+    """Split IDs into train/test by guitarist, held out on ``test_split``.
 
     A guitarist is the integer prefix of the ID (``<guitarist>_...``), matching
-    the original 6-fold leave-one-guitarist-out protocol.
+    the original 6-fold leave-one-guitarist-out protocol: 5 guitarists train and
+    the held-out one is the test set (there is no separate validation split).
     """
-    partition: dict[str, list[str]] = {"training": [], "validation": []}
+    partition: dict[str, list[str]] = {"training": [], "test": []}
     for ID in list_IDs:
         guitarist = int(ID.split("_")[0])
-        key = "validation" if guitarist == val_split else "training"
+        key = "test" if guitarist == test_split else "training"
         partition[key].append(ID)
     return partition

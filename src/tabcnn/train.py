@@ -59,8 +59,8 @@ def train_one_fold(model, loader, optimizer, epochs, device):
 
 
 @torch.no_grad()
-def predict_validation(model, dataset, batch_size, device):
-    """Run the model over the whole validation set, returning (y_pred, y_gt)
+def predict_test(model, dataset, batch_size, device):
+    """Run the model over the whole test set, returning (y_pred, y_gt)
     as NumPy arrays shaped (N, 6, 21)."""
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     preds, gts = [], []
@@ -101,7 +101,7 @@ def main():
         common = dict(data_path=args.data_path, spec_repr=args.spec_repr,
                       con_win_size=args.con_win_size)
         train_set = TabFrameDataset(partition["training"], **common)
-        val_set = TabFrameDataset(partition["validation"], **common)
+        test_set = TabFrameDataset(partition["test"], **common)
         train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
                                   num_workers=args.num_workers, drop_last=True)
 
@@ -118,7 +118,7 @@ def main():
         torch.save(model.state_dict(), split_folder / "weights.pt")
 
         print("testing...")
-        y_pred, y_gt = predict_validation(model, val_set, args.batch_size, device)
+        y_pred, y_gt = predict_test(model, test_set, args.batch_size, device)
         np.savez(split_folder / "predictions.npz", y_pred=y_pred, y_gt=y_gt)
 
         print("evaluation...")

@@ -81,10 +81,10 @@ def test_metrics_perfect_match():
 
 def test_partition_leaves_one_guitarist_out():
     ids = [f"{g}_clip_{f}" for g in range(6) for f in range(3)]
-    part = partition_ids(ids, val_split=2)
-    assert all(i.startswith("2_") for i in part["validation"])
+    part = partition_ids(ids, test_split=2)
+    assert all(i.startswith("2_") for i in part["test"])
     assert not any(i.startswith("2_") for i in part["training"])
-    assert len(part["training"]) + len(part["validation"]) == len(ids)
+    assert len(part["training"]) + len(part["test"]) == len(ids)
 
 
 def test_dataset_context_window(tmp_path):
