@@ -31,11 +31,13 @@ IGNORE_INDEX = -100
 class TabCNNHead(nn.Module):
     """TabCNN's dense classification head on Kong features."""
 
-    def __init__(self, input_dim=512):
+    def __init__(self, input_dim=512, classifier_input_dim=None):
         super().__init__()
-
+        classifier_input_dim = classifier_input_dim or input_dim
+        self.projection = (nn.Identity() if classifier_input_dim == input_dim
+                           else nn.Linear(input_dim, classifier_input_dim))
         self.dense = nn.Sequential(
-            nn.Linear(input_dim, 128),
+            nn.Linear(classifier_input_dim, 128),
             nn.ReLU(),
             nn.Dropout(0.5),
             nn.Linear(128, N_STRINGS * N_CLASSES),
@@ -43,8 +45,22 @@ class TabCNNHead(nn.Module):
 
     def forward(self, features):
         # [B, T, 512] -> [B, T, 6, 21]
-        logits = self.dense(features)
+        logits = self.dense(self.projection(features))
         return logits.reshape(*logits.shape[:-1], N_STRINGS, N_CLASSES)
+
+
+def load_tabcnn_head(checkpoint, input_dim=512):
+    """Reuse both classifier layers from src/tabcnn/train.py's weights.pt.
+
+    A fresh projection maps Kong features into the CNN classifier's input space.
+    The caller must choose the checkpoint with the same held-out player.
+    """
+    state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    keys = ("0.weight", "0.bias", "3.weight", "3.bias")
+    classifier = {k: state[f"classifier.{k}"] for k in keys}
+    head = TabCNNHead(input_dim, classifier["0.weight"].shape[1])
+    head.dense.load_state_dict(classifier, strict=True)
+    return head
 
 
 class KongHeadA(nn.Module):

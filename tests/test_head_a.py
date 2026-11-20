@@ -30,6 +30,27 @@ def test_head_shape():
     assert head(torch.randn(2, 7, 512)).shape == (2, 7, N_STRINGS, N_CLASSES)
 
 
+def test_pretrained_classifier_transfer_and_roundtrip(tmp_path):
+    from head_a import load_tabcnn_head
+    classifier = nn.Sequential(nn.Linear(5952, 128), nn.ReLU(),
+                               nn.Dropout(0.5), nn.Linear(128, 126))
+    path = tmp_path / "weights.pt"
+    torch.save({f"classifier.{k}": v for k, v in classifier.state_dict().items()}, path)
+    head = load_tabcnn_head(path)
+    for key, value in classifier.state_dict().items():
+        torch.testing.assert_close(head.dense.state_dict()[key], value)
+    features = torch.randn(2, 3, 512)
+    head.eval()
+    expected = classifier.eval()(head.projection(features)).reshape(2, 3, 6, 21)
+    torch.testing.assert_close(head(features), expected)
+    restored = TabCNNHead(512, head.dense[0].in_features).eval()
+    restored.load_state_dict(head.state_dict())
+    torch.testing.assert_close(restored(features), expected)
+    head(features).sum().backward()
+    assert head.projection.weight.grad is not None
+    assert head.dense[0].weight.grad is not None
+
+
 def test_loss_uniform_and_ignores_padding():
     logits = torch.zeros(2, 10, N_STRINGS, N_CLASSES)
     tab = torch.randint(0, N_CLASSES, (2, 10, N_STRINGS))

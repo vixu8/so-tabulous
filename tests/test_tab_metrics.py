@@ -13,7 +13,7 @@ for sub in ("metrics", "tabcnn", "data"):
     sys.path.insert(0, str(REPO / "src" / sub))
 from tab_metrics import (OPEN_STRING_MIDI, aggregate, frame_metrics,  # noqa: E402
                          note_metrics, playability, tab_grid_to_notes)
-from metrics import pitch_precision, pitch_recall, tab_precision, tab_recall  # noqa: E402
+from metrics import pitch_precision, pitch_recall, tab_precision, tab_recall, tab_disamb  # noqa: E402
 from loader import notes_to_tab_grid  # noqa: E402
 
 REAL_ROOT = REPO / "features" / "v1"
@@ -50,6 +50,16 @@ def test_frame_metrics_match_tabcnn():
     assert m["pitch"]["recall"] == pytest.approx(pitch_recall(p1, g1))
     assert m["tab"]["precision"] == pytest.approx(tab_precision(p1, g1))
     assert m["tab"]["recall"] == pytest.approx(tab_recall(p1, g1))
+    assert m["tdr"] == pytest.approx(tab_disamb(p1, g1))
+
+
+@pytest.mark.parametrize("pred_class", [0, 2])
+def test_frame_tdr_without_correct_pitches(pred_class):
+    gt = np.zeros((1, 1, 6), dtype=np.int64)
+    gt[..., 0] = 1
+    pred = np.zeros_like(gt)
+    pred[..., 0] = pred_class
+    assert frame_metrics(pred, gt, [1])["tdr"] == 0.0
 
 
 def test_frame_metrics_skip_padding_and_frame_1000():
@@ -61,6 +71,7 @@ def test_frame_metrics_skip_padding_and_frame_1000():
     m = frame_metrics(pred, gt, n_valid=[1001, 600])
     assert m["tab"]["precision"] == m["tab"]["recall"] == 1.0
     assert m["pitch"]["f1"] == 1.0
+    assert m["tdr"] == 1.0
 
 
 # ----- note_metrics -----

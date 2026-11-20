@@ -65,7 +65,12 @@ def test_stage1_then_stage2_end_to_end_and_resume(tmp_path):
                      "hdf5_path": f"hdf5s/{track}.h5"})
     pd.DataFrame(rows).to_csv(root / "manifest.csv", index=False)
     out_dir = tmp_path / "runs"
+    tabcnn = tmp_path / "weights.pt"
+    classifier = torch.nn.Sequential(torch.nn.Linear(5952, 128), torch.nn.ReLU(),
+                                     torch.nn.Dropout(0.5), torch.nn.Linear(128, 126))
+    torch.save({f"classifier.{k}": v for k, v in classifier.state_dict().items()}, tabcnn)
     base = ["--root", str(root), "--out_dir", str(out_dir), "--device", "cpu",
+            "--tabcnn_checkpoint", str(tabcnn),
             "--batch_size", "2", "--crops_per_clip", "1", "--num_workers", "0",
             "--workers", "1", "--checkpoint", str(CHECKPOINT), "--kong_repo", str(KONG_REPO)]
     quiet = lambda *_: None  # noqa: E731

@@ -23,6 +23,8 @@ Definitions:
               GuitarSet's own labels score 0.992 (features/v1, all 360 clips).
   Frame P/R/F frame_metrics: same definitions as src/tabcnn/metrics.py (pitch_* /
               tab_*), vectorized; for comparing with the TabCNN replication.
+  Frame TDR   tablature precision / pitch precision (TabCNN's tab_disamb).
+              Returns 0 when pitch precision is zero.
 
 Report both aggregate() numbers: pooled over all notes, and the mean over clips
 (the usual transcription convention).
@@ -225,7 +227,10 @@ def frame_metrics(pred_tab, gt_tab, n_valid):
     tab_tp = int(((pred_tab == gt_tab) & (gt_tab > 0)).sum())
     pred_hot, gt_hot = _pitch_hot(pred_tab), _pitch_hot(gt_tab)
     pitch_tp = int((pred_hot & gt_hot).sum())
+    pitch = _prf(pitch_tp, int(pred_hot.sum()), int(gt_hot.sum()))
+    tab = _prf(tab_tp, int((pred_tab > 0).sum()), int((gt_tab > 0).sum()))
     return {
-        "pitch": _prf(pitch_tp, int(pred_hot.sum()), int(gt_hot.sum())),
-        "tab": _prf(tab_tp, int((pred_tab > 0).sum()), int((gt_tab > 0).sum())),
+        "pitch": pitch,
+        "tab": tab,
+        "tdr": tab["precision"] / pitch["precision"] if pitch["precision"] else 0.0,
     }

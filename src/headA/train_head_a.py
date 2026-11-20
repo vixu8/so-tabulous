@@ -1,6 +1,6 @@
 """Head A trainer, both stages, on one leave-one-player-out fold (5 train players + 1 test).
 
-    python src/headA/train_head_a.py --stage 1 --test_player 05
+    python src/headA/train_head_a.py --stage 1 --test_player 05 --tabcnn_checkpoint checkpoints/tabcnn/5/weights.pt
     python src/headA/train_head_a.py --stage 2 --test_player 05
 
 Model: Kong (TunableKongEncoder) + the fusion adapter -> `features` -> TabCNN's
@@ -10,8 +10,10 @@ There is no validation player (team convention, same as TabCNN): each stage trai
 for a fixed number of epochs and keeps the last one; the sounding threshold is
 fixed in advance (0.5), never picked on the test player.
 
-Stage 1: Kong frozen (run live on random 10 s crops); the adapter and a fresh head
-train. Defaults: AdamW lr 1e-3, weight decay 1e-4, 30 epochs.
+Stage 1: Kong frozen (run live on random 10 s crops); the adapter, a fresh input
+projection, and both pretrained TabCNN classifier layers train. The checkpoint
+must exclude the same test player. Defaults: AdamW lr 1e-3, weight decay 1e-4,
+30 epochs.
 
 Stage 2: starts from the fold's stage 1 adapter + head
 (<out_dir>/stage1_test{T}/final.pt) and a fresh rank-8 LoRA on every Kong
@@ -57,7 +59,7 @@ for _sub in (HERE, HERE.parent / "data", HERE.parent / "kong_wrapper", HERE.pare
     if str(_sub) not in sys.path:
         sys.path.insert(0, str(_sub))
 import eval_head_a as ev  # noqa: E402
-from head_a import KongHeadA, predict_tab_grid, tab_loss  # noqa: E402
+from head_a import KongHeadA, TabCNNHead, load_tabcnn_head, predict_tab_grid, tab_loss  # noqa: E402
 from loader import GuitarSetDataset, collate, load_split  # noqa: E402
 from lora import TunableKongEncoder, load_lora_state_dict, lora_parameters, lora_state_dict  # noqa: E402
 from tab_metrics import frame_metrics  # noqa: E402
@@ -89,13 +91,18 @@ def stage1_dir(args):
 def build_model(args, device):
     """Stage 1: frozen Kong + fresh adapter and head. Stage 2: LoRA'd Kong + stage 1's."""
     torch.manual_seed(args.seed)                   # same adapter / head init every run
+    if args.stage == 1 and not args.tabcnn_checkpoint:
+        raise ValueError("Stage 1 requires --tabcnn_checkpoint pointing to the matching "
+                         "held-out player's TabCNN weights.pt")
     encoder = TunableKongEncoder.from_checkpoint(args.checkpoint, repo_path=args.kong_repo,
                                                  use_adapter=True)             # starts frozen
     model = KongHeadA(encoder)
     if args.stage == 1:
+        model.head = load_tabcnn_head(args.tabcnn_checkpoint, encoder.feature_dim)
         model.set_stage(1)
         return model.to(device)
     stage1 = torch.load(stage1_dir(args) / "final.pt", map_location="cpu", weights_only=False)
+    model.head = TabCNNHead(encoder.feature_dim, stage1["head"]["dense.0.weight"].shape[1])
     model.encoder.fusion_adapter.load_state_dict(stage1["adapter"])
     model.head.load_state_dict(stage1["head"])
     model.set_stage(2, rank=args.rank, alpha=args.alpha)
@@ -169,7 +176,7 @@ def run(args, log=None):
 
     np.random.seed(args.seed)
     model = build_model(args, device)
-    source = ("fresh adapter + head" if args.stage == 1
+    source = (f"fresh adapter + TabCNN classifier from {args.tabcnn_checkpoint}" if args.stage == 1
               else f"stage 1 adapter + head from {stage1_dir(args)}")
     log(f"stage {args.stage}; device {device}; run {run_dir}; {source}")
     torch.manual_seed(args.seed)
@@ -298,6 +305,7 @@ def finish(args, model, run_dir, history, device, log):
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--stage", type=int, choices=(1, 2), required=True)
+    p.add_argument("--tabcnn_checkpoint", help="stage 1: TabCNN weights.pt for the same held-out player")
     p.add_argument("--root", default=str(REPO / "features" / "v1"))
     p.add_argument("--test_player", default="05")
     p.add_argument("--tag", default=None, help="run folder prefix (default stage1 / stage2)")
