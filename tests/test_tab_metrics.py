@@ -234,3 +234,20 @@ def test_real_grid_round_trip(real_clips):
     f = aggregate(per_clip)["tab_onset"]["pooled"]["f1"]
     print(f"\ngrid -> notes round trip, onset Tab F1: {f:.4f}")
     assert f >= 0.95
+
+
+def test_frame_tdr_with_duplicate_predicted_pitch():
+    gt = np.array([[[0, 0, 0, 0, 0, 1]]])  # E4 on high E
+    pred = np.array([[[0, 0, 0, 0, 6, 1]]])  # also E4 on B
+    m = frame_metrics(pred, gt, [1])
+    assert m["tab"]["precision"] == 0.5
+    assert m["pitch"]["precision"] == 1.0
+    assert m["tdr"] == 1.0
+    assert tab_disamb(onehot(pred.reshape(-1, 6)), onehot(gt.reshape(-1, 6))) == 1.0
+
+
+def test_grid_single_frame_has_positive_duration():
+    tab = np.zeros((3, 6), dtype=np.int64)
+    tab[1, 0] = 1
+    notes = tab_grid_to_notes(tab)
+    np.testing.assert_allclose(notes, [[0, 0, 0.01, 0.02]])
