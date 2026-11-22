@@ -53,13 +53,18 @@ After training, eval_decoder.evaluate decodes the test clips with every
 --decoding (default greedy and beam, --beam_size 4, --length_penalty 1.0,
 optional --max_chord_span) and scores them at frame and note level.
 
-For EC2 / long runs: everything is logged to <run_dir>/train.log; <run_dir>/last.pt
-is saved every epoch, and --resume continues from it (a finished run, one with
-eval.json, is skipped).
+For EC2 / long runs: everything is logged to <run_dir>/train.log. Each epoch logs
+loss, token accuracy, grad norm, lr, the epoch's time, total time so far, an ETA
+for the remaining epochs and (CUDA) peak GPU memory; every --log_every optimizer
+steps (default 50, 0 = off) a progress line inside the epoch gives running loss /
+token accuracy, steps/s and the time left in the epoch. <run_dir>/history.jsonl
+(one JSON line per finished epoch) is rewritten every epoch, so curves can be
+plotted while the run is going. <run_dir>/last.pt is saved every epoch, and
+--resume continues from it (a finished run, one with eval.json, is skipped).
 
 Writes <out_dir>/<tag>_test{T}/ or <tag>_zeroshot/ (tag defaults to stage1 /
 stage2): final.pt (decoder [+ LoRA A/B] + model config + tokenizer config),
-last.pt, metrics.json, eval.json, test_notes_<decoding>.npz, train.log.
+last.pt, metrics.json, eval.json, test_notes_<decoding>.npz, train.log, history.jsonl.
 """
 
 from __future__ import annotations
@@ -200,6 +205,24 @@ class Logger:
             f.write(line + "\n")
 
 
+def fmt_time(seconds):
+    """45 s, 12m05s, 3h02m."""
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return f"{seconds} s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{seconds % 3600 // 60:02d}m"
+
+
+def write_history(run_dir, history):
+    """<run_dir>/history.jsonl: one line per finished epoch (rewritten whole, so a
+    resumed run never leaves duplicate epochs)."""
+    with open(Path(run_dir) / "history.jsonl", "w") as f:
+        for h in history:
+            f.write(json.dumps(h) + "\n")
+
+
 def groups_of(loader, n):
     """Yield lists of n consecutive batches (the last group may be shorter)."""
     group = []
@@ -242,6 +265,8 @@ def run(args, log=None):
     run_dir = Path(args.out_dir) / f"{args.tag}_{run_suffix(args)}"
     run_dir.mkdir(parents=True, exist_ok=True)
     log = log or Logger(run_dir / "train.log")
+    t_start = time.time()
+    log(f"started {time.strftime('%Y-%m-%d %H:%M:%S')}")
     if args.resume and (run_dir / "eval.json").exists():
         log(f"{run_dir} already finished (eval.json exists); skipping")
         return json.loads((run_dir / "eval.json").read_text())
@@ -290,9 +315,12 @@ def run(args, log=None):
         history, start = last["history"], last["epoch"] + 1
         log(f"resumed after epoch {last['epoch']}")
 
+    t_train = time.time()
     for epoch in range(start, args.epochs + 1):
         t0 = time.time()
         model.train()
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         sums, steps = defaultdict(float), 0
         for group in groups_of(loader, args.grad_accum):
             loss, accuracy, grad_norm, truncated = train_step(model, group, opt, params, args,
@@ -303,19 +331,42 @@ def run(args, log=None):
             sums["grad_norm"] += grad_norm
             sums["truncated"] += truncated
             steps += 1
+            if args.log_every and steps % args.log_every == 0 and steps < steps_per_epoch:
+                elapsed = time.time() - t0
+                log(f"  epoch {epoch} step {steps}/{steps_per_epoch} | loss "
+                    f"{sums['loss'] / steps:.4f} | token acc {sums['accuracy'] / steps:.3f} | "
+                    f"lr {sched.get_last_lr()[0]:.2e} | {steps / elapsed:.2f} steps/s | "
+                    f"{fmt_time(elapsed)}, ~{fmt_time(elapsed / steps * (steps_per_epoch - steps))}"
+                    " left in epoch")
         train = {k: v / max(steps, 1) for k, v in sums.items() if k != "truncated"}
         train["truncated_sequences"] = int(sums["truncated"])
-        history.append({"epoch": epoch, "train": train, "lr_end": sched.get_last_lr()[0],
-                        "seconds": time.time() - t0})
+        seconds = time.time() - t0
+        done = epoch - start + 1                                # epochs run this session
+        eta = (time.time() - t_train) / done * (args.epochs - epoch)
+        record = {"epoch": epoch, "train": train, "lr_end": sched.get_last_lr()[0],
+                  "seconds": seconds, "elapsed_seconds": time.time() - t_start,
+                  "steps": steps}
+        if device.type == "cuda":
+            record["peak_mem_gb"] = torch.cuda.max_memory_allocated(device) / 1e9
+        history.append(record)
         log(f"epoch {epoch:3d}/{args.epochs} | loss {train.get('loss', float('nan')):.4f} | "
             f"token acc {train.get('accuracy', float('nan')):.3f} | grad norm "
-            f"{train.get('grad_norm', float('nan')):.2f} | lr {history[-1]['lr_end']:.2e} | "
-            f"{history[-1]['seconds']:.0f} s"
+            f"{train.get('grad_norm', float('nan')):.2f} | lr {record['lr_end']:.2e} | "
+            f"{fmt_time(seconds)} (total {fmt_time(record['elapsed_seconds'])}, ETA "
+            f"{fmt_time(eta)})"
+            + (f" | peak mem {record['peak_mem_gb']:.1f} GB" if "peak_mem_gb" in record else "")
             + (f" | {train['truncated_sequences']} truncated" if train["truncated_sequences"] else ""))
+        write_history(run_dir, history)
         torch.save({"epoch": epoch, "state": snapshot(model), "optimizer": opt.state_dict(),
                     "scheduler": sched.state_dict(), "torch_rng": torch.get_rng_state(),
                     "history": history}, last_path)
-    return finish(args, model, run_dir, history, device, log)
+    if start <= args.epochs:
+        log(f"training done: {args.epochs - start + 1} epochs in {fmt_time(time.time() - t_train)}")
+    t_eval = time.time()
+    result = finish(args, model, run_dir, history, device, log)
+    log(f"eval took {fmt_time(time.time() - t_eval)}; run total {fmt_time(time.time() - t_start)} "
+        f"(finished {time.strftime('%Y-%m-%d %H:%M:%S')})")
+    return result
 
 
 def finish(args, model, run_dir, history, device, log):
@@ -373,6 +424,8 @@ def parse_args(argv=None):
     p.add_argument("--grad_accum", type=int, default=None,
                    help="microbatches per optimizer step (default: 1 decoder1, 4 decoder2)")
     p.add_argument("--crops_per_clip", type=int, default=2, help="random 10 s crops per clip per epoch")
+    p.add_argument("--log_every", type=int, default=50,
+                   help="progress line every N optimizer steps inside an epoch (0 = off)")
     p.add_argument("--decode_batch", type=int, default=16, help="test windows decoded at once")
     ev.add_decoding_args(p)
     p.add_argument("--amp", action="store_true", help="bf16 autocast (CUDA only)")
