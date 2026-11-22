@@ -1,7 +1,7 @@
 """Head A trainer, both stages, on one leave-one-player-out fold (5 train players + 1 test).
 
-    python src/headA/train_head_a.py --stage 1 --test_player 05 --tabcnn_checkpoint checkpoints/tabcnn/5/weights.pt
-    python src/headA/train_head_a.py --stage 2 --test_player 05
+python src/headA/train_head_a.py --stage 1 --test_player 05 --tabcnn_checkpoint checkpoints/tabcnn/5/weights.pt
+python src/headA/train_head_a.py --stage 2 --test_player 05
 
 Model: Kong (TunableKongEncoder) + the fusion adapter -> `features` -> TabCNN's
 dense head -> 21 classes per string per frame (src/headA/head_a.py).
