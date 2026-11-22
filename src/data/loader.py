@@ -104,6 +104,32 @@ def load_split(root, test_player):
     return {k: df.reset_index(drop=True) for k, df in splits.items()}
 
 
+MANIFEST_COLUMNS = ("track_id", "hdf5_path")
+
+
+def load_manifest(root):
+    """Every manifest row of a features folder -> DataFrame (no split).
+
+    Used for the SynthTab decoder (decoder2): it trains on every clip of a SynthTab
+    features folder and is tested zero-shot on every GuitarSet clip. Any folder in
+    the features/v1 layout works:
+      manifest.csv  one row per clip; needs track_id and hdf5_path (relative to
+                    root); duration and player_id are optional
+      HDF5 files    waveform int16 (16 kHz mono) and tab_notes float32 (N, 4) =
+                    [string, fret, onset_s, offset_s], string 0 = low E, standard
+                    tuning, frets 0..MAX_FRET, sorted by onset then string
+    (Assumed layout for the SynthTab subset until its preprocessing script lands.)
+    """
+    manifest = pd.read_csv(Path(root) / "manifest.csv", dtype={"player_id": str,
+                                                               "track_id": str})
+    missing = [c for c in MANIFEST_COLUMNS if c not in manifest.columns]
+    if missing:
+        raise ValueError(f"{Path(root) / 'manifest.csv'} lacks columns {missing}")
+    if manifest.track_id.duplicated().any():
+        raise ValueError(f"{Path(root) / 'manifest.csv'} has duplicate track_ids")
+    return manifest.reset_index(drop=True)
+
+
 # ----- target helpers (module level so heads / metrics can reuse them) -----
 
 def notes_to_tab_grid(notes, start_s=0.0, n_frames=N_FRAMES):
