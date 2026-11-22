@@ -7,6 +7,10 @@ third_party/
 src/tabcnn/model/
 src/tabcnn/data/
 
+# synthtab development dataset
+src/data/synthtab-dev
+synthtab_preprocessed
+
 # Python
 __pycache__/
 *.py[cod]
