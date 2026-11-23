@@ -182,12 +182,16 @@ def run_shard(box, shard, jams_root, s3, work, workers):
     zpath = work / "shard.zip"
     shutil.rmtree(out, ignore_errors=True)   # out is always rebuilt fresh
 
-    # Resume shortcut: the zip is unlinked only after a *successful* unzip, so a
-    # populated dest with no leftover shard.zip means download+unzip already
-    # finished (a prior run crashed later, e.g. in preprocess). Reuse it instead of
-    # re-pulling ~30 GB. Otherwise start clean. rmtree unlinks the jams symlink, not
-    # its target.
-    if dest.is_dir() and any(dest.iterdir()) and not zpath.exists():
+    # Resume shortcut: reuse an already-extracted shard instead of re-pulling ~30 GB
+    # (a prior run crashed later, e.g. in preprocess). We require a marker naming the
+    # *exact* shard whose zip is extracted -- NOT just "dest is populated": acoustic's
+    # part_N zips of one synth all share the same dest (effect/synth), so a populated
+    # dest can't tell part_2 apart from part_1's leftovers. The marker is written only
+    # after a successful unzip, and rmtree clears it on a fresh start.
+    marker = root / ".extracted_shard"
+    reuse = (dest.is_dir() and any(dest.iterdir()) and not zpath.exists()
+             and marker.is_file() and marker.read_text().strip() == shard["name"])
+    if reuse:
         print(f"  reusing already-extracted raw for {shard['name']} "
               f"(skipping download+unzip)", flush=True)
         jlink = root / "jams"              # always (re)point at the current jams_root
@@ -195,7 +199,7 @@ def run_shard(box, shard, jams_root, s3, work, workers):
             jlink.unlink()
         jlink.symlink_to(jams_root, target_is_directory=True)
     else:
-        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(root, ignore_errors=True)   # also clears any stale marker
         dest.mkdir(parents=True)
         (root / "jams").symlink_to(jams_root, target_is_directory=True)
         t = time.time()
@@ -207,6 +211,7 @@ def run_shard(box, shard, jams_root, s3, work, workers):
         t = time.time()
         subprocess.run(["unzip", "-q", str(zpath), "-d", str(dest)], check=True)
         zpath.unlink()
+        marker.write_text(shard["name"])          # mark THIS shard fully extracted
         print(f"  unzipped in {(time.time() - t) / 60:.1f} min; preprocessing...", flush=True)
     # VERIFY on the first shard: dest should now hold <song>/<song>/..._body.flac
 
