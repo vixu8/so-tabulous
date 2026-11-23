@@ -26,5 +26,11 @@ dist/
 # Training runs (checkpoints, metrics)
 runs/
 
+# SynthTab sharded-preprocessing scratch (generated per run / per environment)
+shards.tsv
+stage.log
+manifests/
+stats/
+
 # pytest --basetemp output (committed by accident in f87296f)
 .test-head-a-transfer-approved/
