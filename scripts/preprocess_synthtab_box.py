@@ -210,7 +210,6 @@ def main():
     args = ap.parse_args()
     s3 = args.s3.rstrip("/")
     work = Path(args.work)
-    work.mkdir(parents=True, exist_ok=True)
 
     box = Box(os.environ["BOX_SHARED_LINK"])
     shards, jams_id = plan(box, os.environ["BOX_ROOT_FOLDER_ID"])
@@ -221,6 +220,7 @@ def main():
             print(f"  {s['name']:60s} {s['size']/1e9:6.1f} GB  ({s['effect']}/{s['synth']})")
         return
 
+    work.mkdir(parents=True, exist_ok=True)
     jams_root = (work / "jams_extracted").resolve()
     if not jams_root.exists():
         print("== jams (one-time) ==", flush=True)
