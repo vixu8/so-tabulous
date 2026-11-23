@@ -51,6 +51,7 @@ import json
 import multiprocessing as mp
 import os
 import re
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 
@@ -356,17 +357,28 @@ def main():
 
     worker = functools.partial(process_track, hdf5_dir=hdf5_dir,
                                kong_events=not args.no_kong_events)
-    tracks = iter_synthtab_tracks(args.synthtab_root, limit=args.limit)
+    # Materialize so we know the total up front (just directory walks, no file
+    # reads) -- lets the progress line show N/total and an ETA.
+    tracks = list(iter_synthtab_tracks(args.synthtab_root, limit=args.limit))
+    total = len(tracks)
+    print(f"found {total} renders with audio+labels; processing with "
+          f"{args.workers} worker(s)", flush=True)
     pool = mp.Pool(args.workers) if args.workers > 1 else None
     results = pool.imap_unordered(worker, tracks, chunksize=1) if pool else map(worker, tracks)
+    t0 = time.time()
     try:
         for i, (row, st, fc) in enumerate(results):
             stats.update(st)          # Counter.update adds counts
             fret_counts.update(fc)
             if row is not None:       # None = skipped (e.g. non-standard tuning)
                 rows.append(row)
-            if (i + 1) % 100 == 0:
-                print(f"  processed {i + 1} clips ({len(rows)} written)")
+            if (i + 1) % 50 == 0 or (i + 1) == total:
+                el = time.time() - t0
+                rate = (i + 1) / el if el else 0.0
+                eta = (total - (i + 1)) / rate / 60 if rate else 0.0
+                print(f"  {i + 1}/{total} clips ({len(rows)} written, "
+                      f"{stats['skipped_tracks']} skipped) -- "
+                      f"{rate:.1f} clips/s, ETA {eta:.1f} min", flush=True)
     finally:
         if pool:
             pool.close()

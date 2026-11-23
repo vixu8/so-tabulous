@@ -140,8 +140,9 @@ def plan(box, root_id):
             else:
                 effect, synth = path[-1], stem           # electric/<effect>/<synth>.zip
             shard_name = re.sub(r"[^0-9A-Za-z]+", "_", f"{effect}__{synth}__{stem}").strip("_")
+            category = path[0] if path else ""   # top-level: acoustic / electric
             shards.append({"effect": effect, "synth": synth, "name": shard_name,
-                           "file_id": it["id"], "size": it["size"]})
+                           "category": category, "file_id": it["id"], "size": it["size"]})
     if jams_id is None:
         raise SystemExit("no jams zip found at the share root")
     shards.sort(key=lambda s: s["name"])
@@ -172,30 +173,53 @@ def run_shard(box, shard, jams_root, s3, work, workers):
         return
     print(f"== {shard['name']} ({shard['size'] / 1e9:.1f} GB) ==", flush=True)
 
-    # Fresh root holding ONLY this shard's audio (+ jams), so preprocess can't pick
-    # up leftovers from a prior/crashed shard. rmtree unlinks the jams symlink, not
-    # its target. jams must sit at <root>/jams for preprocess_synthtab to find it.
+    # Stage ONLY this shard's audio (+ a jams symlink) under work/raw, so preprocess
+    # can't pick up leftovers from a prior/crashed shard. jams must sit at
+    # <root>/jams for preprocess_synthtab to find it.
     root, out = work / "raw", work / "out"
-    shutil.rmtree(root, ignore_errors=True)
-    shutil.rmtree(out, ignore_errors=True)
     dest = root / shard["effect"] / shard["synth"]
-    dest.mkdir(parents=True)
-    (root / "jams").symlink_to(jams_root, target_is_directory=True)
-
     zpath = work / "shard.zip"
-    box.download(shard["file_id"], zpath)
-    subprocess.run(["unzip", "-q", str(zpath), "-d", str(dest)], check=True)
-    zpath.unlink()
+    shutil.rmtree(out, ignore_errors=True)   # out is always rebuilt fresh
+
+    # Resume shortcut: the zip is unlinked only after a *successful* unzip, so a
+    # populated dest with no leftover shard.zip means download+unzip already
+    # finished (a prior run crashed later, e.g. in preprocess). Reuse it instead of
+    # re-pulling ~30 GB. Otherwise start clean. rmtree unlinks the jams symlink, not
+    # its target.
+    if dest.is_dir() and any(dest.iterdir()) and not zpath.exists():
+        print(f"  reusing already-extracted raw for {shard['name']} "
+              f"(skipping download+unzip)", flush=True)
+        jlink = root / "jams"
+        if not jlink.is_symlink():
+            jlink.symlink_to(jams_root, target_is_directory=True)
+    else:
+        shutil.rmtree(root, ignore_errors=True)
+        dest.mkdir(parents=True)
+        (root / "jams").symlink_to(jams_root, target_is_directory=True)
+        t = time.time()
+        box.download(shard["file_id"], zpath)
+        dl_gb = zpath.stat().st_size / 1e9
+        dt = time.time() - t
+        print(f"  downloaded {dl_gb:.1f} GB in {dt / 60:.1f} min "
+              f"({dl_gb * 1000 / dt:.0f} MB/s); unzipping...", flush=True)
+        t = time.time()
+        subprocess.run(["unzip", "-q", str(zpath), "-d", str(dest)], check=True)
+        zpath.unlink()
+        print(f"  unzipped in {(time.time() - t) / 60:.1f} min; preprocessing...", flush=True)
     # VERIFY on the first shard: dest should now hold <song>/<song>/..._body.flac
 
+    t = time.time()
     subprocess.run([sys.executable, str(PREPROCESS), "--synthtab_root", str(root),
                     "--out_dir", str(out), "--no_kong_events", "--workers", str(workers)],
                    check=True)
+    print(f"  preprocessed in {(time.time() - t) / 60:.1f} min; uploading to S3...", flush=True)
 
+    t = time.time()
     s3_sync(out / "hdf5s", f"{s3}/hdf5s")
     s3_cp(out / "manifest.csv", manifest_uri)
     if (out / "stats.json").exists():
         s3_cp(out / "stats.json", f"{s3}/stats/{shard['name']}.json")
+    print(f"  DONE {shard['name']}: committed to S3 in {(time.time() - t) / 60:.1f} min", flush=True)
     shutil.rmtree(dest, ignore_errors=True)
     shutil.rmtree(out, ignore_errors=True)
 
@@ -206,6 +230,11 @@ def main():
     ap.add_argument("--s3", required=True, help="s3://bucket/prefix for the processed output")
     ap.add_argument("--work", default="/data/work")
     ap.add_argument("--workers", type=int, default=os.cpu_count())
+    ap.add_argument("--filter", metavar="REGEX", default=None,
+                    help="only process shards whose '<category>/<name>' matches this "
+                         "regex, e.g. '^acoustic' or '^electric'. Run disjoint filters "
+                         "on separate instances to parallelize (outputs share one S3 "
+                         "prefix; merge_manifests combines them).")
     ap.add_argument("--dry-run", action="store_true", help="just print the shard plan")
     args = ap.parse_args()
     s3 = args.s3.rstrip("/")
@@ -213,8 +242,14 @@ def main():
 
     box = Box(os.environ["BOX_SHARED_LINK"])
     shards, jams_id = plan(box, os.environ["BOX_ROOT_FOLDER_ID"])
+    if args.filter:
+        pat = re.compile(args.filter)
+        shards = [s for s in shards if pat.search(f"{s['category']}/{s['name']}")]
+        if not shards:
+            raise SystemExit(f"--filter {args.filter!r} matched no shards")
     total_gb = sum(s["size"] for s in shards) / 1e9
-    print(f"{len(shards)} shards, {total_gb:.0f} GB raw total")
+    print(f"{len(shards)} shards, {total_gb:.0f} GB raw total"
+          + (f"  (filter {args.filter!r})" if args.filter else ""))
     if args.dry_run:
         for s in shards:
             print(f"  {s['name']:60s} {s['size']/1e9:6.1f} GB  ({s['effect']}/{s['synth']})")
