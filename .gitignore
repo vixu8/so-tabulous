@@ -9,7 +9,7 @@ src/tabcnn/data/
 
 # synthtab development dataset
 src/data/synthtab-dev
-synthtab_preprocessed
+src/data/synthtab-dev-preprocessed
 
 # Python
 __pycache__/

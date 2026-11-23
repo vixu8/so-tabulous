@@ -37,14 +37,21 @@ def write_clip(path, notes, player, seconds=12.0, seed=0):
         hf.create_dataset("tab_notes", data=np.asarray(notes, np.float32))
 
 
-def write_dataset(root, tracks, notes, seconds=12.0, seed=0):
-    """A features/v1-style folder: manifest.csv + one HDF5 per (track_id, player)."""
+def write_dataset(root, tracks, notes, seconds=12.0, seed=0, splits=None):
+    """A features/v1-style folder: manifest.csv + one HDF5 per (track_id, player).
+
+    `splits`, if given, is a per-track split label (adds a `split` column, like the
+    SynthTab manifest); otherwise there is no split column.
+    """
     (root / "hdf5s").mkdir(parents=True)
     rows = []
     for i, (track, player) in enumerate(tracks):
         write_clip(root / "hdf5s" / f"{track}.h5", notes, player, seconds, seed=seed + i)
-        rows.append({"track_id": track, "player_id": player, "duration": seconds,
-                     "hdf5_path": f"hdf5s/{track}.h5"})
+        row = {"track_id": track, "player_id": player, "duration": seconds,
+               "hdf5_path": f"hdf5s/{track}.h5"}
+        if splits is not None:
+            row["split"] = splits[i]
+        rows.append(row)
     pd.DataFrame(rows).to_csv(root / "manifest.csv", index=False)
     return root
 
@@ -121,8 +128,9 @@ def test_synthtab_data_never_includes_guitarset(tmp_path):
     st = write_dataset(tmp_path / "st", [("synth_0", "s"), ("synth_1", "s")], notes)
     a = parse_args(["--arch", "decoder2", "--stage", "1", "--root", str(gs),
                     "--train_root", str(st)])
-    train, root, test = training_data(a)
+    train, val, root, test = training_data(a)
     assert list(train.track_id) == ["synth_0", "synth_1"] and root == str(st)
+    assert val is None                                          # no split column -> no val
     assert list(test.track_id) == ["00_A", "01_B"]              # every GuitarSet clip
     with pytest.raises(ValueError, match="never"):
         training_data(parse_args(["--arch", "decoder2", "--stage", "1", "--root", str(gs),
@@ -131,6 +139,20 @@ def test_synthtab_data_never_includes_guitarset(tmp_path):
     with pytest.raises(ValueError, match="never see"):
         training_data(parse_args(["--arch", "decoder2", "--stage", "1", "--root", str(gs),
                                   "--train_root", str(leak)]))
+
+
+def test_synthtab_split_column_yields_val(tmp_path):
+    notes = [[2, 2, 1.0, 1.5]]
+    gs = write_dataset(tmp_path / "gs", [("00_A", "00")], notes)
+    st = write_dataset(tmp_path / "st",
+                       [("tr0", "s"), ("tr1", "s"), ("va0", "s"), ("te0", "s")], notes,
+                       splits=["train", "train", "val", "test"])
+    a = parse_args(["--arch", "decoder2", "--stage", "1", "--root", str(gs),
+                    "--train_root", str(st)])
+    train, val, root, test = training_data(a)
+    assert list(train.track_id) == ["tr0", "tr1"]       # split == train
+    assert list(val.track_id) == ["va0"]                # split == val
+    assert "te0" not in set(train.track_id) | set(val.track_id)   # test rows never trained on
 
 
 def test_lr_schedule_warmup_then_cosine_to_zero():

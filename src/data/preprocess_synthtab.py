@@ -7,11 +7,13 @@ SynthTab is synthesised from Guitar Pro tabs (DadaGP), so unlike GuitarSet the
 rendered with several guitar synths; we treat every render as its own clip but
 take the split from the *tab* (song) so renders of one song never cross splits.
 
-Split: keyed on the song (tab), so a song's renders never cross splits. The dev
-subset ships no split file, so `split_for_tab` hashes the song into an 80/10/10
-train/val/test split; swap in SynthTab's official split for the full dataset.
-There is no leave-one-player-out regrouping here (that is GuitarSet's scheme): to
-build a dataset, filter the manifest and hand the rows straight to
+Split: train/val only (SynthTab is training data; GuitarSet is the decoder's
+zero-shot test). Keyed on the Guitar Pro file (`gp_file`), so every render AND
+every guitar track of a song lands in the same split -- no leakage into val.
+`split_for_tab` hashes that key, sending VAL_FRACTION of files to val. The dev
+subset ships no split file; swap in SynthTab's official split for the full
+dataset. There is no leave-one-player-out regrouping here (that is GuitarSet's
+scheme): to build a dataset, filter the manifest and hand the rows straight to
 GuitarSetDataset, e.g.
 
     import pandas as pd
@@ -61,7 +63,8 @@ from preprocessing import (MAX_FRET, OPEN_STRING_MIDI, SAMPLE_RATE,
                            float32_to_int16, to_kong_events)
 
 N_STRINGS = len(OPEN_STRING_MIDI)
-SPLITS = ("train", "val", "test")
+SPLITS = ("train", "val")          # SynthTab is training-only; GuitarSet is the test set
+VAL_FRACTION = 0.05                # held-out val share, keyed on the Guitar Pro file
 
 
 # --------------------------------------------------------------------------- #
@@ -100,16 +103,27 @@ class SkipTrack(Exception):
     """This track can't be represented (e.g. a non-standard tuning); skip it."""
 
 
-def split_for_tab(tab_id):
-    """Deterministic 80/10/10 split keyed on the song, so every render of a tab
-    lands in the same split.
+def gp_file(tab_id):
+    """Group key = the Guitar Pro file, dropping the '__<track> - <instrument>' tail.
 
-    The dev subset ships no split file. REPLACE this with SynthTab's official
-    split for the full dataset: load its tab->split mapping once and look it up
-    here (keep the per-tab keying so renders never cross splits).
+    'Artist - Title - gp4__3 - Distortion Guitar__midi' -> 'Artist - Title - gp4'.
+    So the several guitar tracks of one song file share a split (names without the
+    gp pattern are their own group). SynthTab is training-only, so there is no test
+    split; GuitarSet is the decoder's zero-shot test.
     """
-    h = int(hashlib.md5(tab_id.encode("utf-8")).hexdigest(), 16) % 1000
-    return "train" if h < 800 else "val" if h < 900 else "test"
+    m = re.match(r"(.*- gp\d+)__\d+", tab_id)
+    return m.group(1) if m else tab_id
+
+
+def split_for_tab(tab_id):
+    """Deterministic train/val split keyed on the Guitar Pro file, so every render
+    AND every track of a song lands in the same split (no leakage into val).
+
+    VAL_FRACTION of files go to val. The dev subset ships no split file; for the
+    full dataset, swap in SynthTab's official split here (keep the gp_file keying).
+    """
+    h = int(hashlib.md5(gp_file(tab_id).encode("utf-8")).hexdigest(), 16) % 1000
+    return "val" if h < round(VAL_FRACTION * 1000) else "train"
 
 
 def _track_id(effect, synth, song):
@@ -315,7 +329,8 @@ def process_track(track, hdf5_dir, kong_events=True):
     write_hdf5(hdf5_path, waveform, midi_events, midi_event_times, clean, meta)
 
     row = {**meta, "n_notes": len(clean),
-           "hdf5_path": os.path.relpath(hdf5_path, os.path.dirname(hdf5_dir)),
+           # POSIX separators so a manifest built on Windows loads on Linux (EC2).
+           "hdf5_path": os.path.relpath(hdf5_path, os.path.dirname(hdf5_dir)).replace(os.sep, "/"),
            "audio_path": track.audio_path}
     return row, stats, fret_counts
 
@@ -366,17 +381,17 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
 
-    # --- Validation: no tab (song) may appear in more than one split ---
-    splits_by_tab = defaultdict(set)
+    # --- Validation: no Guitar Pro file may appear in more than one split ---
+    splits_by_file = defaultdict(set)
     for row in rows:
-        splits_by_tab[row["tab_id"]].add(row["split"])
-    leaked = {t: sorted(s) for t, s in splits_by_tab.items() if len(s) > 1}
-    assert not leaked, f"tab(s) span multiple splits: {dict(list(leaked.items())[:3])}"
+        splits_by_file[gp_file(row["tab_id"])].add(row["split"])
+    leaked = {t: sorted(s) for t, s in splits_by_file.items() if len(s) > 1}
+    assert not leaked, f"song file(s) span multiple splits: {dict(list(leaked.items())[:3])}"
 
     summary = {
         "clips_per_split": dict(Counter(r["split"] for r in rows)),
-        "tabs_per_split": {s: len({r["tab_id"] for r in rows if r["split"] == s})
-                           for s in SPLITS},
+        "gp_files_per_split": {s: len({gp_file(r["tab_id"]) for r in rows if r["split"] == s})
+                               for s in SPLITS},
         "hours_per_split": {s: round(sum(r["duration"] for r in rows if r["split"] == s) / 3600, 3)
                             for s in SPLITS},
         "label_stats": dict(stats),

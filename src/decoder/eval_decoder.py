@@ -83,7 +83,8 @@ def reference_notes(root, rows):
     """{track_id: tab_notes} from the clips' HDF5 files. Same as eval_head_a; keep in sync."""
     refs = {}
     for track_id, rel in zip(rows.track_id, rows.hdf5_path):
-        with h5py.File(Path(root) / rel, "r") as hf:
+        # tolerate "\" in a manifest built on Windows (literal char on Linux)
+        with h5py.File(Path(root) / str(rel).replace("\\", "/"), "r") as hf:
             refs[track_id] = hf["tab_notes"][:]
     return refs
 

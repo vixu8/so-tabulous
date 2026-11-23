@@ -13,8 +13,8 @@ from loader import GuitarSetDataset  # noqa: E402
 from preprocess_synthtab import (FLIP_STRING_ORDER, N_STRINGS,  # noqa: E402
                                  OPEN_STRING_MIDI, SPLITS, SYNTHTAB_PPQ,
                                  SkipTrack, SynthTabTrack, _flip_string,
-                                 clean_tab_notes, load_raw_notes, split_for_tab,
-                                 write_hdf5)
+                                 clean_tab_notes, gp_file, load_raw_notes,
+                                 split_for_tab, write_hdf5)
 from tokenizer import TabTokenizer  # noqa: E402
 
 # Guitar Pro / DadaGP open-string pitches in SOURCE order (string 0 = high e,
@@ -126,8 +126,18 @@ def test_load_raw_notes_skips_missing_tempo(tmp_path):
 
 
 def test_split_for_tab_is_deterministic_and_groups_renders():
-    assert split_for_tab("song-A") in SPLITS
+    assert split_for_tab("song-A") in SPLITS and SPLITS == ("train", "val")
     assert split_for_tab("song-A") == split_for_tab("song-A")   # stable per song
+
+
+def test_gp_file_grouping_keeps_song_tracks_together():
+    a = "Artist - Title - gp4__1 - Electric Clean Guitar__midi"
+    b = "Artist - Title - gp4__3 - Distortion Guitar__midi"
+    assert gp_file(a) == gp_file(b) == "Artist - Title - gp4"
+    # different tracks of one song file always share a split -> no val leakage
+    assert split_for_tab(a) == split_for_tab(b)
+    # a different gp file is grouped separately
+    assert gp_file("Artist - Title - gp3__1 - Clean Guitar__midi") == "Artist - Title - gp3"
 
 
 # ----- end to end: write a clip, read it back through the loader, tokenize -----

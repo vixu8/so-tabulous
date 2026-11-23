@@ -130,6 +130,21 @@ def load_manifest(root):
     return manifest.reset_index(drop=True)
 
 
+def load_synthtab_split(root):
+    """SynthTab manifest split by its `split` column: {"train", "val"} -> DataFrame.
+
+    The split is assigned per song in preprocessing (every render of a song shares
+    it), so train and val never share a song. `test` rows, if any, are dropped here
+    (GuitarSet is the decoder's zero-shot test, not SynthTab). A manifest with no
+    `split` column means "train on everything, no validation": all rows are train
+    and val is empty.
+    """
+    m = load_manifest(root)
+    if "split" not in m.columns:
+        return {"train": m, "val": m.iloc[0:0].reset_index(drop=True)}
+    return {s: m[m.split == s].reset_index(drop=True) for s in ("train", "val")}
+
+
 # ----- target helpers (module level so heads / metrics can reuse them) -----
 
 def notes_to_tab_grid(notes, start_s=0.0, n_frames=N_FRAMES):
@@ -229,7 +244,9 @@ class GuitarSetDataset(torch.utils.data.Dataset):
         rows = pd.DataFrame(rows)
         self.clips = []  # (track_id, hdf5 path, n_samples)
         for track_id, rel in zip(rows.track_id, rows.hdf5_path):
-            path = self.root / rel
+            # Accept manifests written on either OS: a Windows-built manifest stores
+            # hdf5_path with "\", which is a literal char (not a separator) on Linux.
+            path = self.root / str(rel).replace("\\", "/")
             with h5py.File(path, "r") as hf:
                 n = int(hf["waveform"].shape[0])
             self.clips.append((str(track_id), path, n))

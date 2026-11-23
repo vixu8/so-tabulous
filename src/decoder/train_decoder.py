@@ -86,7 +86,8 @@ for _sub in (HERE, HERE.parent / "data", HERE.parent / "kong_wrapper", HERE.pare
     if str(_sub) not in sys.path:
         sys.path.insert(0, str(_sub))
 import eval_decoder as ev  # noqa: E402
-from loader import GuitarSetDataset, collate, load_manifest, load_split  # noqa: E402
+from loader import (GuitarSetDataset, collate, load_manifest,  # noqa: E402
+                    load_split, load_synthtab_split)
 from lora import TunableKongEncoder, load_lora_state_dict, lora_parameters, lora_state_dict  # noqa: E402
 from tab_decoder import (ARCH_CONFIGS, DEFAULT_CONFIG, FFN_TYPES, KongTabDecoder,  # noqa: E402
                          split_tokens, token_accuracy, token_loss)
@@ -111,21 +112,27 @@ def stage1_dir(args):
 
 
 def training_data(args):
-    """(train rows, their root, test rows): a GuitarSet fold, or SynthTab -> all of GuitarSet."""
+    """(train rows, val rows or None, their root, test rows).
+
+    GuitarSet fold: a player split, no val. SynthTab: split by the manifest's
+    `split` column (train on `train`, validate on `val`); test is all of GuitarSet.
+    val is None when there are no `val` rows (manifest with no split column).
+    """
     if args.data == "guitarset":
         splits = load_split(args.root, args.test_player)
-        return splits["train"], args.root, splits["test"]
+        return splits["train"], None, args.root, splits["test"]
     train_root, test_root = Path(args.train_root).resolve(), Path(args.root).resolve()
     if train_root == test_root:
         raise ValueError("--data synthtab: --train_root is the GuitarSet --root; the SynthTab "
                          "decoder must never train on GuitarSet")
-    train, test = load_manifest(train_root), load_manifest(test_root)
-    shared = set(train.track_id) & set(test.track_id)
+    sp = load_synthtab_split(args.train_root)
+    train, val, test = sp["train"], sp["val"], load_manifest(test_root)
+    shared = (set(train.track_id) | set(val.track_id)) & set(test.track_id)
     if shared:
         raise ValueError(f"--data synthtab: {len(shared)} training clips are GuitarSet clips "
                          f"(e.g. {sorted(shared)[0]}); the SynthTab decoder must never see "
                          "GuitarSet")
-    return train, args.train_root, test
+    return train, (val if len(val) else None), args.train_root, test
 
 
 # ----- model -----
@@ -260,6 +267,34 @@ def train_step(model, group, opt, params, args, device):
     return loss_total, correct / max(n_tokens, 1), float(grad_norm), truncated
 
 
+@torch.no_grad()
+def validate(model, loader, args, device):
+    """Teacher-forced token loss / accuracy over the val set (no generation).
+
+    One forward pass per batch (same as a train step but no backward), so it is
+    cheap enough to run every epoch. Token-weighted so clips of different length
+    count by their real tokens. Returns None for an empty / missing val loader.
+    """
+    if loader is None:
+        return None
+    was_training = model.training
+    model.eval()
+    loss_sum, correct, n_tokens = 0.0, 0.0, 0
+    for b in loader:
+        b = batch_to(b, device)
+        tokens_in, targets = split_tokens(b["tokens"], model.max_len)
+        n = int((targets != PAD_ID).sum())
+        if n == 0:
+            continue
+        with ev.autocast(device, args.amp):
+            logits = model(b["waveform"], tokens_in, b["n_valid_frames"])
+        loss_sum += token_loss(logits, targets, reduction="sum").item()
+        correct += token_accuracy(logits, targets).item() * n
+        n_tokens += n
+    model.train(was_training)
+    return {"loss": loss_sum / max(n_tokens, 1), "accuracy": correct / max(n_tokens, 1)}
+
+
 def run(args, log=None):
     device = ev.pick_device(args.device)
     run_dir = Path(args.out_dir) / f"{args.tag}_{run_suffix(args)}"
@@ -278,7 +313,7 @@ def run(args, log=None):
     log(f"{args.arch}, stage {args.stage}; device {device}; run {run_dir}; {source}; "
         f"decoder {model.config}" + ("; bf16 autocast" if args.amp and device.type == "cuda" else ""))
     torch.manual_seed(args.seed)
-    train_rows, train_root, test_rows = training_data(args)
+    train_rows, val_rows, train_root, test_rows = training_data(args)
     train_ds = GuitarSetDataset(train_rows, train_root, mode="random", targets=("tokens",),
                                 crops_per_clip=args.crops_per_clip)
     if train_ds.tokenizer != model.tokenizer:
@@ -286,6 +321,14 @@ def run(args, log=None):
     loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate,
                         num_workers=args.num_workers, persistent_workers=args.num_workers > 0,
                         pin_memory=device.type == "cuda", drop_last=True)
+    val_loader = None
+    if val_rows is not None:
+        # Fixed, non-overlapping windows (not random crops): a reproducible val set,
+        # the same clips and windows every epoch so val loss is comparable over time.
+        val_ds = GuitarSetDataset(val_rows, train_root, mode="windows", targets=("tokens",))
+        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                                collate_fn=collate, num_workers=args.num_workers,
+                                pin_memory=device.type == "cuda")
     groups = param_groups(model, args.weight_decay)
     params = [p for g in groups for p in g["params"]]
     opt = torch.optim.AdamW(groups, lr=args.lr)
@@ -293,7 +336,9 @@ def run(args, log=None):
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lr_lambda(args.warmup_epochs * steps_per_epoch, args.epochs * steps_per_epoch))
     n_lora = sum(p.numel() for p in lora_parameters(model.encoder.note_model))
-    data = (f"{args.data}: train {len(train_rows)} clips from {train_root}, test "
+    data = (f"{args.data}: train {len(train_rows)} clips from {train_root}, "
+            + (f"val {len(val_rows)} clips, " if val_rows is not None else "no val, ")
+            + "test "
             + (f"all {len(test_rows)} GuitarSet clips (zero-shot)" if args.data == "synthtab"
                else f"player {args.test_player} ({len(test_rows)} clips)"))
     log(data)
@@ -348,12 +393,16 @@ def run(args, log=None):
                   "steps": steps}
         if device.type == "cuda":
             record["peak_mem_gb"] = torch.cuda.max_memory_allocated(device) / 1e9
+        val = validate(model, val_loader, args, device)
+        if val is not None:
+            record["val"] = val
         history.append(record)
         log(f"epoch {epoch:3d}/{args.epochs} | loss {train.get('loss', float('nan')):.4f} | "
             f"token acc {train.get('accuracy', float('nan')):.3f} | grad norm "
             f"{train.get('grad_norm', float('nan')):.2f} | lr {record['lr_end']:.2e} | "
             f"{fmt_time(seconds)} (total {fmt_time(record['elapsed_seconds'])}, ETA "
             f"{fmt_time(eta)})"
+            + (f" | val loss {val['loss']:.4f} | val acc {val['accuracy']:.3f}" if val else "")
             + (f" | peak mem {record['peak_mem_gb']:.1f} GB" if "peak_mem_gb" in record else "")
             + (f" | {train['truncated_sequences']} truncated" if train["truncated_sequences"] else ""))
         write_history(run_dir, history)
