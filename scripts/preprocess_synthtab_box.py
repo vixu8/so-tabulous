@@ -27,6 +27,7 @@ Needs: requests, the aws CLI, and `unzip` on PATH.
 """
 
 import argparse
+import csv
 import os
 import re
 import shutil
@@ -215,19 +216,31 @@ def run_shard(box, shard, jams_root, s3, work, workers):
                    check=True)
     print(f"  preprocessed in {(time.time() - t) / 60:.1f} min; uploading to S3...", flush=True)
 
+    # Nest this shard's HDF5s under hdf5s/<shard>/ so each per-shard sync lists only
+    # its own (empty) subprefix instead of the whole growing set, and a shard's
+    # outputs can be deleted/redone atomically. Rewrite the manifest's hdf5_path to
+    # match (loader resolves files relative to the features root, so the subfolder
+    # must be in the recorded path). preprocess writes "hdf5s/<track_id>.h5".
+    mpath = out / "manifest.csv"
+    with open(mpath, newline="") as mf:
+        rows = list(csv.DictReader(mf))
     # A shard with zero clips almost always means a setup bug (e.g. jams not found ->
     # every song skipped with "no jams"), not a genuinely empty shard. Refuse to
     # commit it, so it isn't marked done in S3 with an empty manifest.
-    with open(out / "manifest.csv") as mf:
-        n_rows = sum(1 for _ in mf) - 1          # minus the header line
-    if n_rows <= 0:
+    if not rows:
         raise SystemExit(f"{shard['name']}: preprocess produced 0 clips -- refusing to "
                          f"commit. Check the 'no jams'/'no flac' skips above and that "
                          f"'jams root:' points at the folder holding <song>/ dirs.")
+    for r in rows:
+        r["hdf5_path"] = r["hdf5_path"].replace("hdf5s/", f"hdf5s/{shard['name']}/", 1)
+    with open(mpath, "w", newline="") as mf:
+        w = csv.DictWriter(mf, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        w.writerows(rows)
 
     t = time.time()
-    s3_sync(out / "hdf5s", f"{s3}/hdf5s")
-    s3_cp(out / "manifest.csv", manifest_uri)
+    s3_sync(out / "hdf5s", f"{s3}/hdf5s/{shard['name']}")
+    s3_cp(mpath, manifest_uri)
     if (out / "stats.json").exists():
         s3_cp(out / "stats.json", f"{s3}/stats/{shard['name']}.json")
     print(f"  DONE {shard['name']}: committed to S3 in {(time.time() - t) / 60:.1f} min", flush=True)
