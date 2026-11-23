@@ -275,14 +275,16 @@ def main():
         jams_root.mkdir()
         subprocess.run(["unzip", "-q", str(jz), "-d", str(jams_root)], check=True)
         jz.unlink()
-    # The jams zip wraps its songs in a top-level 'jams/' folder; descend into it so
-    # the songs sit at <jams_root>/<song>/*.jams. Resolve on EVERY run, not just the
-    # first extraction -- on a resume jams_extracted already exists, so if this were
-    # guarded by the extraction block jams_root would point one level too high and
-    # preprocess would skip every song with "no jams".
-    if (jams_root / "jams").is_dir():
-        jams_root = (jams_root / "jams").resolve()
-    print(f"jams root: {jams_root}", flush=True)
+    # The jams zip nests songs under wrapper folders whose names vary (seen:
+    # jams/outall/<song>/<file>.jams). Find the real root -- the dir whose children
+    # are the <song> dirs -- from a sample .jams file, since that is exactly the
+    # level iter_synthtab_tracks globs (<jams_root>/<song>/*.jams). Works for any
+    # number of wrappers, and is resolved on EVERY run so a resume agrees.
+    sample = next(jams_root.rglob("*.jams"), None)
+    if sample is None:
+        raise SystemExit(f"no .jams files found under {jams_root}")
+    jams_root = sample.parent.parent
+    print(f"jams root: {jams_root}  (e.g. {sample.name})", flush=True)
 
     for shard in shards:
         run_shard(box, shard, jams_root, s3, work, args.workers)
