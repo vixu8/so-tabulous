@@ -189,9 +189,10 @@ def run_shard(box, shard, jams_root, s3, work, workers):
     if dest.is_dir() and any(dest.iterdir()) and not zpath.exists():
         print(f"  reusing already-extracted raw for {shard['name']} "
               f"(skipping download+unzip)", flush=True)
-        jlink = root / "jams"
-        if not jlink.is_symlink():
-            jlink.symlink_to(jams_root, target_is_directory=True)
+        jlink = root / "jams"              # always (re)point at the current jams_root
+        if jlink.is_symlink() or jlink.exists():
+            jlink.unlink()
+        jlink.symlink_to(jams_root, target_is_directory=True)
     else:
         shutil.rmtree(root, ignore_errors=True)
         dest.mkdir(parents=True)
@@ -213,6 +214,16 @@ def run_shard(box, shard, jams_root, s3, work, workers):
                     "--out_dir", str(out), "--no_kong_events", "--workers", str(workers)],
                    check=True)
     print(f"  preprocessed in {(time.time() - t) / 60:.1f} min; uploading to S3...", flush=True)
+
+    # A shard with zero clips almost always means a setup bug (e.g. jams not found ->
+    # every song skipped with "no jams"), not a genuinely empty shard. Refuse to
+    # commit it, so it isn't marked done in S3 with an empty manifest.
+    with open(out / "manifest.csv") as mf:
+        n_rows = sum(1 for _ in mf) - 1          # minus the header line
+    if n_rows <= 0:
+        raise SystemExit(f"{shard['name']}: preprocess produced 0 clips -- refusing to "
+                         f"commit. Check the 'no jams'/'no flac' skips above and that "
+                         f"'jams root:' points at the folder holding <song>/ dirs.")
 
     t = time.time()
     s3_sync(out / "hdf5s", f"{s3}/hdf5s")
@@ -264,10 +275,14 @@ def main():
         jams_root.mkdir()
         subprocess.run(["unzip", "-q", str(jz), "-d", str(jams_root)], check=True)
         jz.unlink()
-        # jams zip may wrap its songs in a top-level folder; expose it as <root>/jams.
-        inner = [p for p in jams_root.iterdir() if p.is_dir() and p.name == "jams"]
-        if inner:
-            jams_root = inner[0].resolve()
+    # The jams zip wraps its songs in a top-level 'jams/' folder; descend into it so
+    # the songs sit at <jams_root>/<song>/*.jams. Resolve on EVERY run, not just the
+    # first extraction -- on a resume jams_extracted already exists, so if this were
+    # guarded by the extraction block jams_root would point one level too high and
+    # preprocess would skip every song with "no jams".
+    if (jams_root / "jams").is_dir():
+        jams_root = (jams_root / "jams").resolve()
+    print(f"jams root: {jams_root}", flush=True)
 
     for shard in shards:
         run_shard(box, shard, jams_root, s3, work, args.workers)
