@@ -90,15 +90,21 @@ def reference_notes(root, rows):
 
 
 def load_model(final_path, device, checkpoint=None, kong_repo=None):
-    """Rebuild KongTabDecoder from train_decoder.py's final.pt (frozen Kong + LoRA if stage 2)."""
+    """Rebuild KongTabDecoder from train_decoder.py's final.pt (frozen Kong + LoRA if stage 2;
+    with kong_init "random", the trained random-init Kong stored in the checkpoint)."""
     ckpt = torch.load(final_path, map_location="cpu", weights_only=False)
     if "adapter" in ckpt:
         raise ValueError(f"{final_path} was trained with the fusion adapter, which the decoder "
                          "no longer uses; retrain it")
     args = ckpt["args"]
-    encoder = TunableKongEncoder.from_checkpoint(checkpoint or args["checkpoint"],
-                                                 repo_path=kong_repo or args["kong_repo"],
-                                                 use_adapter=False)
+    repo = kong_repo or args["kong_repo"]
+    if ckpt.get("kong_init", "pretrained") == "random":
+        encoder = TunableKongEncoder.from_scratch(repo_path=repo, use_adapter=False)
+        encoder.note_model.load_state_dict(ckpt["kong"], strict=True)
+        encoder.set_finetune("frozen")                # eval only: BN on its trained stats
+    else:
+        encoder = TunableKongEncoder.from_checkpoint(checkpoint or args["checkpoint"],
+                                                     repo_path=repo, use_adapter=False)
     model = KongTabDecoder(encoder, TabTokenizer.from_dict(ckpt["tokenizer"]), **ckpt["config"])
     model.decoder.load_state_dict(ckpt["decoder"])
     if ckpt.get("lora"):

@@ -14,10 +14,16 @@ Modes (set_finetune):
             and every nn.GRU weight_ih / weight_hh (biases untouched); only A and
             B train. B starts at zero, so adding LoRA doesn't change Kong's outputs.
   "full"    Every Kong weight trains (merge or drop LoRA first).
+  "scratch" For a randomly initialized Kong (KongEncoder.from_scratch, the
+            pretraining ablation): every Kong weight trains, BatchNorm too
+            (it follows train()/eval() and updates its running statistics),
+            except the STFT / log-mel frontend, which Kong builds with
+            freeze_parameters=True (fixed DSP filters, not learned weights).
 In "lora" and "full", Kong follows train()/eval() (dropout on when training, as
 in Kong's own training), except BatchNorm, which always keeps its pretrained
 statistics: a LoRA checkpoint (A / B only) then fully describes the model, and
-batches of 4-8 clips would give noisy statistics. (Kong's in-place dropout bug at
+batches of 4-8 clips would give noisy statistics. "scratch" has no pretrained
+statistics to keep, so its BatchNorm trains. (Kong's in-place dropout bug at
 models.py:149 is fixed when kong_encoder.py loads the model.)
 
 Use set_finetune on this class, not set_backbone_frozen.
@@ -41,7 +47,8 @@ from torch.nn.utils import parametrize
 
 from kong_encoder import KongEncoder
 
-FINETUNE_MODES = ("frozen", "lora", "full")
+FINETUNE_MODES = ("frozen", "lora", "full", "scratch")
+FRONTEND_MODULES = ("spectrogram_extractor", "logmel_extractor")   # Kong's fixed DSP
 LORA_KINDS = ("linear", "gru")
 
 
@@ -166,17 +173,20 @@ class TunableKongEncoder(KongEncoder):
                 p.requires_grad_(True)
         else:
             if has_lora(self.note_model):
-                raise ValueError("full fine-tuning with LoRA attached; call "
+                raise ValueError(f"{mode} training with LoRA attached; call "
                                  "merge_lora(encoder.note_model) first")
             self.set_backbone_frozen(False)
+            if mode == "scratch":
+                for name in FRONTEND_MODULES:
+                    getattr(self.note_model, name).requires_grad_(False)
         self.finetune = mode
-        if mode != "frozen":
+        if mode in ("lora", "full"):
             self._freeze_batchnorm()
         return self
 
     def train(self, mode: bool = True) -> TunableKongEncoder:
         super().train(mode)          # frozen: Kong in eval; otherwise Kong follows `mode`
-        if getattr(self, "finetune", "frozen") != "frozen":
+        if getattr(self, "finetune", "frozen") in ("lora", "full"):
             self._freeze_batchnorm()
         return self
 
