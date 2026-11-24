@@ -23,8 +23,8 @@ Definitions:
               GuitarSet's own labels score 0.992 (features/v1, all 360 clips).
   Frame P/R/F frame_metrics: same definitions as src/tabcnn/metrics.py (pitch_* /
               tab_*), vectorized; for comparing with the TabCNN replication.
-  Frame TDR   tablature precision / pitch precision (TabCNN's tab_disamb).
-              Returns 0 when pitch precision is zero.
+  Frame TDR   correct string-fret detections / correct distinct pitch detections.
+              Returns 0 when no pitches are correctly detected.
 
 Report both aggregate() numbers: pooled over all notes, and the mean over clips
 (the usual transcription convention).
@@ -183,7 +183,7 @@ def tab_grid_to_notes(tab, start_s=0.0, onsets=None, fps=FRAMES_PER_SECOND):
     """(T, 6) tab classes (0 silent, fret + 1) -> (N, 4) tab_notes rows, sorted by onset, string.
 
     A run of one class on a string becomes a note from a / fps to b / fps
-    (inverse of the loader's inclusive frame rule). With an `onsets` (T, 6) bool
+    with b the exclusive end of the run. With an `onsets` (T, 6) bool
     grid, a new note also starts wherever it is True inside a run.
     """
     tab = np.asarray(tab)
@@ -194,7 +194,7 @@ def tab_grid_to_notes(tab, start_s=0.0, onsets=None, fps=FRAMES_PER_SECOND):
         if onsets is not None:
             starts |= np.asarray(onsets)[:, s].astype(bool)
         idx = np.nonzero(starts)[0]
-        ends = np.r_[idx[1:], len(c)] - 1
+        ends = np.r_[idx[1:], len(c)]
         for a, b in zip(idx, ends):
             if c[a] > 0:
                 rows.append((s, c[a] - 1, start_s + a / fps, start_s + b / fps))
@@ -220,8 +220,8 @@ def frame_metrics(pred_tab, gt_tab, n_valid):
     < min(n_valid, 1000) count: padding is skipped, and frame 1000 is the next
     window's frame 0.
     """
-    pred_tab, gt_tab = torch.as_tensor(pred_tab).long(), torch.as_tensor(gt_tab).long()
-    n_valid = torch.as_tensor(n_valid).clamp(max=FRAMES_PER_WINDOW)
+    pred_tab, gt_tab = torch.as_tensor(pred_tab).detach().cpu().long(), torch.as_tensor(gt_tab).detach().cpu().long()
+    n_valid = torch.as_tensor(n_valid).detach().cpu().clamp(max=FRAMES_PER_WINDOW)
     keep = torch.arange(gt_tab.shape[1])[None, :] < n_valid[:, None]
     pred_tab, gt_tab = pred_tab[keep], gt_tab[keep]                 # (frames, 6)
     tab_tp = int(((pred_tab == gt_tab) & (gt_tab > 0)).sum())
@@ -232,5 +232,5 @@ def frame_metrics(pred_tab, gt_tab, n_valid):
     return {
         "pitch": pitch,
         "tab": tab,
-        "tdr": tab["precision"] / pitch["precision"] if pitch["precision"] else 0.0,
+        "tdr": tab_tp / pitch_tp if pitch_tp else 0.0,
     }

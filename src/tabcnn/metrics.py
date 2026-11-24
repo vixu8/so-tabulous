@@ -3,7 +3,8 @@
 Ported from the original Wiggins & Kim TabCNN (Python 2 + Keras) to Python 3.
 The only real change from the original is replacing the Python 2 idiom
 ``np.array(map(fn, arr))`` (which relied on ``map`` returning a list) with an
-explicit stack, so the math is identical on NumPy >= 1.x / Python 3.
+explicit stack. TDR uses the paper's Eq. 8 count ratio rather than the
+original implementation's precision ratio.
 
 All functions take ``pred`` and ``gt`` as arrays shaped (N, 6, 21): N frames,
 6 strings, 21 classes (0 = string not played, 1..20 = fret 0..19).
@@ -92,6 +93,7 @@ def tab_f_measure(pred, gt):
 
 
 def tab_disamb(pred, gt):
-    tp = tab_precision(pred, gt)
-    pp = pitch_precision(pred, gt)
-    return tp / pp
+    """Paper Eq. 8: correct string-fret detections / correct distinct pitches."""
+    tab_tp = np.sum(_stack(tab2bin, pred) * _stack(tab2bin, gt))
+    pitch_tp = np.sum(_stack(tab2pitch, pred) * _stack(tab2pitch, gt))
+    return float(tab_tp / pitch_tp) if pitch_tp else 0.0
