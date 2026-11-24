@@ -17,6 +17,15 @@ Auth (env): BOX_SHARED_LINK, BOX_ROOT_FOLDER_ID, and a token source:
   auto-refresh (unattended), either:
     CCG:   BOX_CLIENT_ID, BOX_CLIENT_SECRET, BOX_ENTERPRISE_ID
     OAuth: BOX_CLIENT_ID, BOX_CLIENT_SECRET, BOX_REFRESH_TOKEN
+           Box refresh tokens are single-use: each refresh returns a new one and
+           invalidates the old. The rotated token is persisted to
+           --refresh-token-file (default ~/.synthtab_box_refresh) and reloaded on
+           resume, so a crash doesn't strand you on a stale token. BOX_REFRESH_TOKEN
+           only SEEDS the first run. Because the token rotates, one token cannot be
+           shared across concurrent instances (they'd invalidate each other) -- give
+           each instance its OWN refresh token + its own file. (CCG has no refresh
+           token, so it fans out across instances freely -- prefer it if an admin
+           can authorize a Client Credentials Grant app.)
 
 Needs: requests, the aws CLI, and `unzip` on PATH.
 
@@ -46,9 +55,32 @@ PREPROCESS = REPO / "src" / "data" / "preprocess_synthtab.py"
 # ----- Box -----
 
 class Box:
-    def __init__(self, shared_link):
+    def __init__(self, shared_link, refresh_token_file=None):
         self.shared_link = shared_link
+        self.refresh_token_file = refresh_token_file
         self._token, self._exp = None, 0.0
+        self._refresh_token = self._load_refresh_token()
+
+    def _load_refresh_token(self):
+        """The persisted (rotated) token is the source of truth once it exists; the
+        BOX_REFRESH_TOKEN env var only seeds the very first run. So a resume picks up
+        the latest token instead of a stale, already-rotated one."""
+        if self.refresh_token_file:
+            p = Path(self.refresh_token_file)
+            if p.is_file():
+                tok = p.read_text().strip()
+                if tok:
+                    return tok
+        return os.environ.get("BOX_REFRESH_TOKEN")
+
+    def _save_refresh_token(self, tok):
+        self._refresh_token = tok
+        if self.refresh_token_file:
+            p = Path(self.refresh_token_file)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_name(p.name + ".tmp")
+            tmp.write_text(tok)
+            os.replace(tmp, p)                 # atomic: a crash mid-write can't truncate it
 
     def _refresh(self):
         cid, sec = os.environ.get("BOX_CLIENT_ID"), os.environ.get("BOX_CLIENT_SECRET")
@@ -57,17 +89,24 @@ class Box:
             data = {"grant_type": "client_credentials", "client_id": cid, "client_secret": sec,
                     "box_subject_type": "enterprise",
                     "box_subject_id": os.environ["BOX_ENTERPRISE_ID"]}
-        elif cid and sec and os.environ.get("BOX_REFRESH_TOKEN"):
+        elif cid and sec and self._refresh_token:
             data = {"grant_type": "refresh_token", "client_id": cid, "client_secret": sec,
-                    "refresh_token": os.environ["BOX_REFRESH_TOKEN"]}
+                    "refresh_token": self._refresh_token}
         if data:
-            j = requests.post("https://api.box.com/oauth2/token", data=data, timeout=30)
-            j.raise_for_status()
-            tok = j.json()
+            r = requests.post("https://api.box.com/oauth2/token", data=data, timeout=30)
+            if r.status_code == 400 and data["grant_type"] == "refresh_token":
+                raise SystemExit(
+                    "Box refresh failed (400). The refresh token is expired or already "
+                    "rotated (they're single-use), e.g. if this token was reused by "
+                    "another instance. Re-mint one via the authorize flow, then set "
+                    f"BOX_REFRESH_TOKEN and delete {self.refresh_token_file} to re-seed. "
+                    f"Box said: {r.text}")
+            r.raise_for_status()
+            tok = r.json()
             self._token = tok["access_token"]
             self._exp = time.time() + tok.get("expires_in", 3600) - 300
-            if "refresh_token" in tok and os.environ.get("BOX_REFRESH_TOKEN"):
-                os.environ["BOX_REFRESH_TOKEN"] = tok["refresh_token"]   # rotated
+            if "refresh_token" in tok and self._refresh_token:
+                self._save_refresh_token(tok["refresh_token"])   # rotated; persist for resume
         elif os.environ.get("BOX_TOKEN"):
             self._token, self._exp = os.environ["BOX_TOKEN"], time.time() + 3300
         else:
@@ -259,6 +298,13 @@ def main():
     ap.add_argument("--s3", required=True, help="s3://bucket/prefix for the processed output")
     ap.add_argument("--work", default="/data/work")
     ap.add_argument("--workers", type=int, default=os.cpu_count())
+    ap.add_argument("--refresh-token-file",
+                    default=os.environ.get("BOX_REFRESH_TOKEN_FILE",
+                                           os.path.expanduser("~/.synthtab_box_refresh")),
+                    help="where to persist the rotating OAuth refresh token (OAuth "
+                         "path only; see module docstring). Must be unique per "
+                         "instance -- the default is per-machine, which is fine when "
+                         "each instance is its own box.")
     ap.add_argument("--filter", metavar="REGEX", default=None,
                     help="only process shards whose '<category>/<name>' matches this "
                          "regex, e.g. '^acoustic' or '^electric'. Run disjoint filters "
@@ -269,7 +315,7 @@ def main():
     s3 = args.s3.rstrip("/")
     work = Path(args.work)
 
-    box = Box(os.environ["BOX_SHARED_LINK"])
+    box = Box(os.environ["BOX_SHARED_LINK"], args.refresh_token_file)
     shards, jams_id = plan(box, os.environ["BOX_ROOT_FOLDER_ID"])
     if args.filter:
         pat = re.compile(args.filter)
