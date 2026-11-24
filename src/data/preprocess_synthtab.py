@@ -79,6 +79,14 @@ VAL_FRACTION = 0.05                # held-out val share, keyed on the Guitar Pro
 # <song> is the DadaGP tab id shared across every render. Labels live under jams/
 # keyed by <song>, NOT next to the audio.
 #
+# The depth of the audio tree is NOT fixed: the acoustic zips extract to
+# <root>/<effect>/<synth>/<song>/..., but the electric zips are one zip per
+# effect whose top-level folders are the synths, so they land one level deeper --
+# <root>/<effect>/<effect>/<synth>/<song>/... So iter_synthtab_tracks does not
+# assume a depth; it walks the tree and recognises a render's song dir by name
+# (any dir matching a labelled folder under jams/), reading effect/synth back off
+# the path. This self-corrects for any number of wrapper folders.
+#
 # The JAMS has 6 `note_tab` annotations (one per string) + 1 `tempo` annotation.
 # Each note: time/duration in MIDI ticks (PPQ below), value.fret, value.velocity.
 # Each note_tab sandbox: {"string_index": 1..6, "open_tuning": <open MIDI>}, with
@@ -148,33 +156,42 @@ def _find_flac(song_dir):
 
 def iter_synthtab_tracks(root, limit=None):
     """Yield a SynthTabTrack for every (song, effect/synth) render with both audio
-    and labels present. Renders missing either are skipped with a message."""
+    and labels present. Renders missing either are skipped with a message.
+
+    The audio tree's depth varies by effect (see the layout note above), so we do
+    not assume a fixed <effect>/<synth>/<song> depth. Instead we walk the whole
+    tree and treat any directory whose name matches a labelled song (a folder
+    under jams/) as a render's song dir, reading effect = first path component and
+    synth = last, back off its path. This recognises the electric wrapper level
+    without special-casing it."""
     jams_root = os.path.join(root, "jams")
-    effects = sorted(d for d in os.listdir(root)
-                     if d != "jams" and os.path.isdir(os.path.join(root, d)))
+    labelled = set(os.listdir(jams_root)) if os.path.isdir(jams_root) else set()
     n = 0
-    for effect in effects:
-        for synth in sorted(os.listdir(os.path.join(root, effect))):
-            synth_dir = os.path.join(root, effect, synth)
-            if not os.path.isdir(synth_dir):
+    # os.walk defaults to followlinks=False, so the jams symlink (and its label
+    # tree) is never descended into -- only the audio tree is walked.
+    for dirpath, dirnames, _ in os.walk(root):
+        for song in sorted(d for d in dirnames if d in labelled):
+            song_dir = os.path.join(dirpath, song)
+            rel = os.path.relpath(dirpath, root).split(os.sep)
+            effect, synth = rel[0], rel[-1]       # rel = [effect, ..., synth]
+            flac = _find_flac(song_dir)
+            jams = glob.glob(os.path.join(jams_root, song, "*.jams"))
+            if flac is None or not jams:
+                print(f"SKIP {effect}/{synth}/{song}: "
+                      f"{'no flac' if flac is None else 'no jams'}")
                 continue
-            for song in sorted(os.listdir(synth_dir)):
-                song_dir = os.path.join(synth_dir, song)
-                if not os.path.isdir(song_dir):
-                    continue
-                flac = _find_flac(song_dir)
-                jams = glob.glob(os.path.join(jams_root, song, "*.jams"))
-                if flac is None or not jams:
-                    print(f"SKIP {effect}/{synth}/{song}: "
-                          f"{'no flac' if flac is None else 'no jams'}")
-                    continue
-                yield SynthTabTrack(track_id=_track_id(effect, synth, song),
-                                    tab_id=song, synth=f"{effect}/{synth}",
-                                    split=split_for_tab(song),
-                                    audio_path=flac, label_path=jams[0])
-                n += 1
-                if limit is not None and n >= limit:
-                    return
+            yield SynthTabTrack(track_id=_track_id(effect, synth, song),
+                                tab_id=song, synth=f"{effect}/{synth}",
+                                split=split_for_tab(song),
+                                audio_path=flac, label_path=jams[0])
+            n += 1
+            if limit is not None and n >= limit:
+                return
+        # Don't descend into a matched song dir: the audio double-nests an
+        # identically named <song>/<song> inner dir (the flac is found by the
+        # recursive glob in _find_flac), which would otherwise match again and
+        # yield the render twice. Sorting keeps traversal deterministic.
+        dirnames[:] = sorted(d for d in dirnames if d not in labelled)
 
 
 # Guitar Pro / DadaGP number strings from the high e (string 1) down to the low
