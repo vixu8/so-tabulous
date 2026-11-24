@@ -19,12 +19,21 @@ which makes loss.backward() fail in train mode on current torch ("modified by an
 inplace operation"). When loading Kong, the wrapper gives that module a
 torch.nn.functional whose dropout is never in place (_NoInplaceDropoutFunctional).
 Kong's file is not edited and outputs are unchanged; training in train mode works.
+
+Random init (pretraining ablation): `KongEncoder.from_scratch()` builds the same
+note model without loading any checkpoint, so it keeps Kong's own constructor
+init (init_layer / init_bn / init_gru). By default it also swaps in
+_forward_no_detach: Kong's forward detaches the onset / offset / velocity
+outputs before they feed frame_gru, so a loss on `features` would never reach
+those three branches. Without the detaches the outputs are identical, but every
+branch gets gradients. `from_checkpoint` never does either.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import sys
+import types
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
@@ -112,6 +121,47 @@ def _make_upstream_note_model(repo_path: str | Path) -> nn.Module:
     return module.Regress_onset_offset_frame_velocity_CRNN(
         frames_per_second=FRAMES_PER_SECOND, classes_num=PIANO_PITCHES
     )
+
+
+def _forward_no_detach(self: nn.Module, input: Tensor) -> dict[str, Tensor]:
+    """Kong's Regress_onset_offset_frame_velocity_CRNN.forward (models.py:212-259)
+    without its three .detach() calls; same values, gradients reach every branch.
+
+    Bound to one note-model instance by KongEncoder.from_scratch(detach=False).
+    Dropout runs out of place (see _NoInplaceDropoutFunctional).
+    """
+    F = torch.nn.functional
+    x = self.spectrogram_extractor(input)   # (batch_size, 1, time_steps, freq_bins)
+    x = self.logmel_extractor(x)            # (batch_size, 1, time_steps, mel_bins)
+
+    x = x.transpose(1, 3)
+    x = self.bn0(x)
+    x = x.transpose(1, 3)
+
+    frame_output = self.frame_model(x)
+    reg_onset_output = self.reg_onset_model(x)
+    reg_offset_output = self.reg_offset_model(x)
+    velocity_output = self.velocity_model(x)
+
+    # Use velocities to condition onset regression (Kong: velocity_output.detach()).
+    x = torch.cat((reg_onset_output, (reg_onset_output ** 0.5) * velocity_output), dim=2)
+    (x, _) = self.reg_onset_gru(x)
+    x = F.dropout(x, p=0.5, training=self.training, inplace=False)
+    reg_onset_output = torch.sigmoid(self.reg_onset_fc(x))
+
+    # Use onsets and offsets to condition frame-wise classification
+    # (Kong: reg_onset_output.detach(), reg_offset_output.detach()).
+    x = torch.cat((frame_output, reg_onset_output, reg_offset_output), dim=2)
+    (x, _) = self.frame_gru(x)
+    x = F.dropout(x, p=0.5, training=self.training, inplace=False)
+    frame_output = torch.sigmoid(self.frame_fc(x))
+
+    return {
+        "reg_onset_output": reg_onset_output,
+        "reg_offset_output": reg_offset_output,
+        "frame_output": frame_output,
+        "velocity_output": velocity_output,
+    }
 
 
 def _extract_note_state(checkpoint: Any) -> dict[str, Tensor]:
@@ -216,6 +266,37 @@ class KongEncoder(nn.Module):
                 hidden_dim=adapter_hidden_dim,
                 dropout=adapter_dropout,
             )
+            if use_adapter
+            else None
+        )
+        return cls(note_model, adapter, backbone_frozen=backbone_frozen)
+
+    @classmethod
+    def from_scratch(
+        cls,
+        *,
+        repo_path: str | Path | None = None,
+        detach: bool = False,
+        use_adapter: bool = False,
+        backbone_frozen: bool = False,
+        adapter_hidden_dim: int = 256,
+        adapter_dropout: float = 0.1,
+    ) -> KongEncoder:
+        """Same note model, randomly initialized (Kong's own init); no checkpoint.
+
+        Seed torch before calling for a reproducible init. detach=False (default)
+        replaces this instance's forward with _forward_no_detach, so a loss on
+        `features` trains all four branches; detach=True keeps Kong's forward.
+        """
+        if repo_path is None:
+            repo_path = Path(__file__).resolve().parent / "third_party" / "piano_transcription"
+        note_model = _make_upstream_note_model(repo_path)
+        if not detach:
+            note_model.forward = types.MethodType(_forward_no_detach, note_model)
+        note_model.kong_detach = detach
+        adapter = (
+            ResidualKongFusion(feature_dim=FEATURE_DIM, hidden_dim=adapter_hidden_dim,
+                               dropout=adapter_dropout)
             if use_adapter
             else None
         )

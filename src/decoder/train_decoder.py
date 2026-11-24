@@ -6,6 +6,8 @@
     # decoder2: SynthTab only, then zero-shot on all of GuitarSet
     python src/decoder/train_decoder.py --arch decoder2 --stage 1 --train_root features/synthtab
     python src/decoder/train_decoder.py --arch decoder2 --stage 2 --train_root features/synthtab
+    # pretraining ablation: decoder1 + randomly initialized Kong, one stage
+    python src/decoder/train_decoder.py --arch decoder1 --kong_init random --stage 1 --test_player 05
 
 Model: Kong (TunableKongEncoder, no fusion adapter) -> `features` (Kong's final GRU,
 512-d per frame) -> a Transformer decoder that writes TabTokenizer tokens
@@ -62,6 +64,17 @@ token accuracy, steps/s and the time left in the epoch. <run_dir>/history.jsonl
 plotted while the run is going. <run_dir>/last.pt is saved every epoch, and
 --resume continues from it (a finished run, one with eval.json, is skipped).
 
+Random Kong (--kong_init random, the pretraining ablation): Kong is built without
+the MAESTRO checkpoint (KongEncoder.from_scratch: Kong's own init, and Kong's
+forward without its .detach()s, so the tab loss reaches every branch) and trains
+together with a fresh decoder in ONE stage (--stage 1; --stage 2 raises), Kong in
+TunableKongEncoder's "scratch" mode: every Kong weight and BatchNorm trains, the
+STFT / log-mel frontend stays fixed. Same loss, optimizer and schedule as above,
+one AdamW group over Kong + decoder. Defaults: lr 3e-4, 75 epochs (= decoder1's
+50 + 25), --out_dir runs/<arch>_randkong, --tag scratch. final.pt / last.pt also
+store the trained Kong state ("kong"); eval_decoder rebuilds it from there.
+The default --kong_init pretrained changes nothing above.
+
 Writes <out_dir>/<tag>_test{T}/ or <tag>_zeroshot/ (tag defaults to stage1 /
 stage2): final.pt (decoder [+ LoRA A/B] + model config + tokenizer config),
 last.pt, metrics.json, eval.json, test_notes_<decoding>.npz, train.log, history.jsonl.
@@ -96,6 +109,8 @@ from tokenizer import PAD_ID, TabTokenizer  # noqa: E402
 REPO = HERE.parents[1]
 DEFAULT_KONG_REPO = HERE.parent / "kong_wrapper" / "third_party" / "piano_transcription"
 STAGE_DEFAULTS = {1: {"lr": 3e-4, "epochs": 50}, 2: {"lr": 1e-4, "epochs": 25}}
+RANDOM_KONG_DEFAULTS = {"lr": 3e-4, "epochs": 75}       # one stage = decoder1's 50 + 25
+KONG_INITS = ("pretrained", "random")
 MODEL_ARGS = ("d_model", "n_layers", "n_heads", "d_ff", "dropout", "max_len", "ffn")
 ARCH_TRAIN_DEFAULTS = {"decoder1": {"data": "guitarset", "batch_size": 8, "grad_accum": 1},
                        "decoder2": {"data": "synthtab", "batch_size": 4, "grad_accum": 4}}
@@ -138,9 +153,20 @@ def training_data(args):
 # ----- model -----
 
 
+def random_kong(args):
+    return getattr(args, "kong_init", "pretrained") == "random"
+
+
 def build_model(args, device):
-    """Stage 1: frozen Kong + fresh decoder. Stage 2: LoRA'd Kong + stage 1's decoder."""
+    """Stage 1: frozen Kong + fresh decoder. Stage 2: LoRA'd Kong + stage 1's decoder.
+    --kong_init random: randomly initialized Kong ("scratch" mode) + fresh decoder."""
     torch.manual_seed(args.seed)                   # same decoder init every run
+    if random_kong(args):
+        encoder = TunableKongEncoder.from_scratch(repo_path=args.kong_repo, use_adapter=False)
+        encoder.set_finetune("scratch")
+        model = KongTabDecoder(encoder, TabTokenizer(),
+                               **{k: getattr(args, k) for k in MODEL_ARGS})
+        return model.to(device)
     encoder = TunableKongEncoder.from_checkpoint(args.checkpoint, repo_path=args.kong_repo,
                                                  use_adapter=False)            # starts frozen
     if args.stage == 1:
@@ -159,10 +185,19 @@ def build_model(args, device):
     return model.to(device)
 
 
-def param_groups(model, weight_decay):
-    """LoRA A/B + decoder; weight decay on matrices (Linear weights, embeddings,
-    LoRA A/B), none on biases or LayerNorm parameters."""
-    params = [*lora_parameters(model.encoder.note_model), *model.decoder.parameters()]
+def kong_parameters(model, kong_init="pretrained"):
+    """Kong's trainable weights: LoRA A/B (none when frozen), or with a random Kong
+    every Kong weight except the fixed frontend."""
+    if kong_init == "random":
+        return model.encoder.trainable_parameters()
+    return lora_parameters(model.encoder.note_model)
+
+
+def param_groups(model, weight_decay, kong_init="pretrained"):
+    """Kong (LoRA A/B, or all of a random Kong) + decoder; weight decay on matrices
+    (Linear / conv weights, GRU matrices, embeddings, LoRA A/B), none on biases,
+    LayerNorm or BatchNorm parameters."""
+    params = [*kong_parameters(model, kong_init), *model.decoder.parameters()]
     decay = [p for p in params if p.ndim >= 2]
     no_decay = [p for p in params if p.ndim < 2]
     return [{"params": decay, "weight_decay": weight_decay},
@@ -183,12 +218,17 @@ def _cpu_state(module):
     return {k: v.detach().cpu().clone() for k, v in module.state_dict().items()}
 
 
-def snapshot(model):
-    return {"lora": lora_state_dict(model.encoder.note_model),
-            "decoder": _cpu_state(model.decoder)}
+def snapshot(model, kong_init="pretrained"):
+    state = {"lora": lora_state_dict(model.encoder.note_model),
+             "decoder": _cpu_state(model.decoder)}
+    if kong_init == "random":                      # the whole trained Kong (+ BN stats)
+        state["kong"] = _cpu_state(model.encoder.note_model)
+    return state
 
 
 def restore(model, state):
+    if state.get("kong") is not None:
+        model.encoder.note_model.load_state_dict(state["kong"], strict=True)
     if state["lora"]:
         load_lora_state_dict(model.encoder.note_model, state["lora"])
     model.decoder.load_state_dict(state["decoder"])
@@ -308,7 +348,9 @@ def run(args, log=None):
 
     np.random.seed(args.seed)
     model = build_model(args, device)
-    source = ("fresh decoder" if args.stage == 1
+    source = ("randomly initialized Kong (no MAESTRO weights, no .detach()) + fresh decoder, "
+              "trained together" if random_kong(args)
+              else "fresh decoder" if args.stage == 1
               else f"stage 1 decoder from {stage1_dir(args)}")
     log(f"{args.arch}, stage {args.stage}; device {device}; run {run_dir}; {source}; "
         f"decoder {model.config}" + ("; bf16 autocast" if args.amp and device.type == "cuda" else ""))
@@ -329,13 +371,13 @@ def run(args, log=None):
         val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                                 collate_fn=collate, num_workers=args.num_workers,
                                 pin_memory=device.type == "cuda")
-    groups = param_groups(model, args.weight_decay)
+    groups = param_groups(model, args.weight_decay, args.kong_init)
     params = [p for g in groups for p in g["params"]]
     opt = torch.optim.AdamW(groups, lr=args.lr)
     steps_per_epoch = math.ceil(len(loader) / args.grad_accum)          # optimizer steps
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lr_lambda(args.warmup_epochs * steps_per_epoch, args.epochs * steps_per_epoch))
-    n_lora = sum(p.numel() for p in lora_parameters(model.encoder.note_model))
+    n_kong = sum(p.numel() for p in kong_parameters(model, args.kong_init))
     data = (f"{args.data}: train {len(train_rows)} clips from {train_root}, "
             + (f"val {len(val_rows)} clips, " if val_rows is not None else "no val, ")
             + "test "
@@ -345,7 +387,7 @@ def run(args, log=None):
     log(f"{len(train_rows)} clips x {args.crops_per_clip} crops = {len(train_ds)} per epoch; "
         f"microbatch {args.batch_size} x {args.grad_accum} accumulation = effective batch "
         f"{args.batch_size * args.grad_accum} ({steps_per_epoch} optimizer steps per epoch); "
-        f"LoRA {n_lora:,} + decoder {sum(p.numel() for p in model.decoder.parameters()):,} "
+        f"{'Kong (random init)' if random_kong(args) else 'LoRA'} {n_kong:,} + decoder {sum(p.numel() for p in model.decoder.parameters()):,} "
         f"trainable; peak lr {args.lr}, weight decay {args.weight_decay}, warmup "
         f"{args.warmup_epochs} epochs then cosine, {args.epochs} epochs (last one kept)")
 
@@ -406,7 +448,7 @@ def run(args, log=None):
             + (f" | peak mem {record['peak_mem_gb']:.1f} GB" if "peak_mem_gb" in record else "")
             + (f" | {train['truncated_sequences']} truncated" if train["truncated_sequences"] else ""))
         write_history(run_dir, history)
-        torch.save({"epoch": epoch, "state": snapshot(model), "optimizer": opt.state_dict(),
+        torch.save({"epoch": epoch, "state": snapshot(model, args.kong_init), "optimizer": opt.state_dict(),
                     "scheduler": sched.state_dict(), "torch_rng": torch.get_rng_state(),
                     "history": history}, last_path)
     if start <= args.epochs:
@@ -421,15 +463,19 @@ def run(args, log=None):
 def finish(args, model, run_dir, history, device, log):
     """Save the final model, then decode + score the test player."""
     config = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}
-    state = snapshot(model)
+    state = snapshot(model, args.kong_init)
     ckpt = {"decoder": state["decoder"], "config": model.config,
             "tokenizer": model.tokenizer.to_dict(), "epochs": args.epochs, "args": config,
-            "stage": args.stage, "arch": args.arch, "data": args.data}
+            "stage": args.stage, "arch": args.arch, "data": args.data,
+            "kong_init": args.kong_init}
+    if random_kong(args):
+        ckpt["kong"] = state["kong"]
     if args.stage == 2:
         ckpt.update(lora=state["lora"], lora_config={"rank": args.rank, "alpha": args.alpha})
     torch.save(ckpt, run_dir / "final.pt")
     (run_dir / "metrics.json").write_text(json.dumps(
         {"arch": args.arch, "data": args.data, "stage": args.stage, "epochs": args.epochs,
+         "kong_init": args.kong_init,
          "config": model.config,
          "batch": {"micro": args.batch_size, "grad_accum": args.grad_accum,
                    "effective": args.batch_size * args.grad_accum},
@@ -454,6 +500,9 @@ def parse_args(argv=None):
     p.add_argument("--stage1_dir", default=None,
                    help="stage 2: folder with stage 1's final.pt (default "
                         "<out_dir>/stage1_test{T} or stage1_zeroshot)")
+    p.add_argument("--kong_init", choices=KONG_INITS, default="pretrained",
+                   help="pretrained (MAESTRO checkpoint; frozen / LoRA stages) or random "
+                        "(pretraining ablation: random Kong + decoder in one stage, --stage 1)")
     p.add_argument("--checkpoint",
                    default=str(REPO / "src" / "kong_wrapper" / "checkpoints" / "kong_note_pedal.pth"))
     p.add_argument("--kong_repo", default=str(DEFAULT_KONG_REPO))
@@ -463,9 +512,11 @@ def parse_args(argv=None):
                        help=f"stage 1: decoder {k} (default: the arch's; stage 2 uses stage 1's)")
     p.add_argument("--rank", type=int, default=8, help="stage 2: LoRA rank")
     p.add_argument("--alpha", type=float, default=16.0, help="stage 2: LoRA alpha")
-    p.add_argument("--lr", type=float, default=None, help="peak lr; default 3e-4 stage 1, 1e-4 stage 2")
+    p.add_argument("--lr", type=float, default=None,
+                   help="peak lr; default 3e-4 stage 1, 1e-4 stage 2, 3e-4 --kong_init random")
     p.add_argument("--weight_decay", type=float, default=0.01)
-    p.add_argument("--epochs", type=int, default=None, help="default: 50 stage 1, 25 stage 2")
+    p.add_argument("--epochs", type=int, default=None,
+                   help="default: 50 stage 1, 25 stage 2, 75 --kong_init random")
     p.add_argument("--warmup_epochs", type=float, default=2.0)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--batch_size", type=int, default=None,
@@ -484,6 +535,13 @@ def parse_args(argv=None):
     p.add_argument("--resume", action="store_true", help="continue from <run_dir>/last.pt")
     args = p.parse_args(argv)
     args.test_player = args.test_player.zfill(2)
+    if args.kong_init == "random":
+        if args.stage != 1:
+            raise ValueError("--kong_init random is one stage (Kong + decoder from scratch); "
+                             "use --stage 1, there is no stage 2")
+        for k, v in RANDOM_KONG_DEFAULTS.items():
+            if getattr(args, k) is None:
+                setattr(args, k, v)
     for k, v in STAGE_DEFAULTS[args.stage].items():
         if getattr(args, k) is None:
             setattr(args, k, v)
@@ -496,8 +554,9 @@ def parse_args(argv=None):
             setattr(args, k, arch[k])
     if args.batch_size < 1 or args.grad_accum < 1:
         raise ValueError("--batch_size and --grad_accum must be >= 1")
-    args.out_dir = args.out_dir or str(REPO / "runs" / args.arch)
-    args.tag = args.tag or f"stage{args.stage}"
+    suffix = "_randkong" if args.kong_init == "random" else ""
+    args.out_dir = args.out_dir or str(REPO / "runs" / f"{args.arch}{suffix}")
+    args.tag = args.tag or ("scratch" if args.kong_init == "random" else f"stage{args.stage}")
     return args
 
 

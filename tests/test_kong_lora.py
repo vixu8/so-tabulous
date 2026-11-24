@@ -229,3 +229,79 @@ def test_kong_modes(kong):
     kong.eval()
     with torch.no_grad():
         torch.testing.assert_close(kong(audio)["features"], kong(audio)["features"], rtol=0, atol=0)
+
+
+# ----- random-init Kong ("scratch" mode, pretraining ablation) -----
+
+FRONTEND = ("spectrogram_extractor", "logmel_extractor")
+
+
+@pytest.fixture(scope="module")
+def kong_repo():
+    if not REPO.is_dir():
+        pytest.skip(f"Kong repo not found at {REPO} (see src/kong_wrapper/README.md)")
+    return REPO
+
+
+def test_from_scratch_is_kongs_own_init_not_the_checkpoint(kong_repo):
+    from kong_encoder import _make_upstream_note_model
+    torch.manual_seed(0)
+    enc = TunableKongEncoder.from_scratch(repo_path=kong_repo)
+    torch.manual_seed(0)
+    plain = _make_upstream_note_model(kong_repo)
+    for (name, a), b in zip(enc.note_model.state_dict().items(), plain.state_dict().values()):
+        assert torch.equal(a, b), name                     # just Kong's constructor init
+    if CHECKPOINT.is_file():
+        from kong_encoder import _extract_note_state
+        ckpt = _extract_note_state(torch.load(CHECKPOINT, map_location="cpu", weights_only=True))
+        w = "frame_model.conv_block1.conv1.weight"
+        assert not torch.equal(enc.note_model.state_dict()[w], ckpt[w])
+    assert enc.note_model.kong_detach is False
+
+
+def test_no_detach_forward_same_values_and_gradient_reaches_every_branch(kong_repo):
+    torch.manual_seed(0)
+    enc = TunableKongEncoder.from_scratch(repo_path=kong_repo)      # no .detach()
+    torch.manual_seed(0)
+    kept = TunableKongEncoder.from_scratch(repo_path=kong_repo, detach=True)
+    audio = torch.randn(2, 16000 * 2) * 0.1
+    for e in (enc, kept):
+        e.set_finetune("scratch")
+        e.eval()
+    with torch.no_grad():
+        a, b = run(enc, audio), run(kept, audio)
+    for k in a:
+        torch.testing.assert_close(a[k], b[k], rtol=0, atol=0)
+
+    def reached(e):
+        e.train()
+        e.zero_grad(set_to_none=True)
+        e(audio)["features"].sum().backward()
+        return {n.split(".")[0] for n, p in e.note_model.named_parameters()
+                if p.grad is not None and p.grad.abs().sum() > 0}
+
+    branches = {"frame_model", "reg_onset_model", "reg_offset_model", "velocity_model",
+                "reg_onset_gru", "reg_onset_fc", "frame_gru", "bn0"}
+    assert reached(enc) == branches                         # frame_fc only feeds piano outputs
+    assert reached(kept) == {"frame_model", "frame_gru", "bn0"}   # Kong's detaches
+
+
+def test_scratch_mode_trains_batchnorm_and_freezes_frontend(kong_repo):
+    torch.manual_seed(0)
+    enc = TunableKongEncoder.from_scratch(repo_path=kong_repo).set_finetune("scratch")
+    trainable = {id(p) for p in enc.trainable_parameters()}
+    for name, p in enc.note_model.named_parameters():
+        assert (id(p) in trainable) == (name.split(".")[0] not in FRONTEND), name
+    assert sum(p.numel() for p in enc.trainable_parameters()) == 20_218_778
+    enc.train()
+    assert all(m.training for m in batchnorms(enc))
+    before = batchnorm_stats(enc)
+    enc(torch.randn(2, 16000 * 2) * 0.1)
+    after = batchnorm_stats(enc)
+    assert any(not torch.equal(x, y) for x, y in zip(before, after))   # stats update
+    enc.eval()
+    assert_batchnorm_frozen(enc)
+    with pytest.raises(ValueError):
+        torch.manual_seed(0)
+        lora = TunableKongEncoder.from_scratch(repo_path=kong_repo).set_finetune("lora")
+        lora.set_finetune("scratch")                        # LoRA attached: merge first

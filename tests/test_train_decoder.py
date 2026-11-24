@@ -78,6 +78,15 @@ def test_parse_args_stage_and_arch_defaults():
                        "--grad_accum", "2", "--data", "guitarset", "--max_chord_span", "5"])
     assert (over.n_layers, over.n_heads, over.grad_accum, over.data, over.max_chord_span) == (
         2, 8, 2, "guitarset", 5)
+    assert a1.kong_init == "pretrained"
+    # Random Kong (pretraining ablation): one stage, 75 epochs at 3e-4, own run folder.
+    r = parse_args(["--kong_init", "random", "--stage", "1"])
+    assert (r.lr, r.epochs, r.tag, r.arch, r.data) == (3e-4, 75, "scratch", "decoder1", "guitarset")
+    assert r.out_dir.endswith("runs/decoder1_randkong")
+    r2 = parse_args(["--kong_init", "random", "--stage", "1", "--epochs", "3", "--lr", "1e-3"])
+    assert (r2.epochs, r2.lr) == (3, 1e-3)
+    with pytest.raises(ValueError, match="one stage"):
+        parse_args(["--kong_init", "random", "--stage", "2"])
 
 
 class FakeEncoder(torch.nn.Module):
@@ -251,6 +260,59 @@ def test_stage1_then_stage2_end_to_end_and_resume(tmp_path):
     run(parse_args(stage2), log=quiet)
     hist = json.loads((run_dir / "metrics.json").read_text())["history"]
     assert [h["epoch"] for h in hist] == [1, 2]
+
+
+@pytest.mark.skipif(not KONG_REPO.is_dir(),
+                    reason="Kong repo missing (see src/kong_wrapper/README.md)")
+def test_random_kong_one_stage_end_to_end_reload_and_resume(tmp_path):
+    notes = [[2, 2, 1.0, 1.5], [4, 1, 1.0, 1.5], [0, 3, 5.0, 6.0]]
+    root = write_dataset(tmp_path / "data", [(f"{p}_Test0-100-C_comp", p) for p in
+                                             ["00", "01", "02", "03", "04", "05"]], notes)
+    out_dir = tmp_path / "runs"
+    base = ["--kong_init", "random", "--stage", "1", "--root", str(root),
+            "--out_dir", str(out_dir), "--device", "cpu", "--batch_size", "2",
+            "--crops_per_clip", "1", "--num_workers", "0", "--kong_repo", str(KONG_REPO),
+            "--checkpoint", str(tmp_path / "missing.pth"),        # never read
+            "--warmup_epochs", "0", "--decode_batch", "4", "--decoding", "greedy",
+            "--d_model", "32", "--n_layers", "1", "--n_heads", "2", "--d_ff", "64",
+            "--max_len", "64", "--lr", "1e-3"]
+    quiet = lambda *_: None  # noqa: E731
+    run(parse_args(base + ["--epochs", "1"]), log=quiet)
+    run_dir = out_dir / "scratch_test05"
+    final = torch.load(run_dir / "final.pt", weights_only=False)
+    assert final["kong_init"] == "random" and final["stage"] == 1 and "lora" not in final
+    assert json.loads((run_dir / "metrics.json").read_text())["kong_init"] == "random"
+
+    # Kong trained from its random init: conv weights and BatchNorm statistics moved.
+    torch.manual_seed(0)
+    from lora import TunableKongEncoder
+    init = TunableKongEncoder.from_scratch(repo_path=KONG_REPO).note_model.state_dict()
+    kong = final["kong"]
+    for k in ("frame_model.conv_block1.conv1.weight", "reg_onset_model.conv_block1.conv1.weight",
+              "velocity_model.conv_block1.conv1.weight", "frame_gru.weight_ih_l0",
+              "bn0.running_mean"):
+        assert not torch.equal(kong[k], init[k]), k
+    for k in ("spectrogram_extractor.stft.conv_real.weight", "logmel_extractor.melW"):
+        assert torch.equal(kong[k], init[k]), k                 # fixed frontend
+
+    # eval_decoder rebuilds the trained random Kong from final.pt and reproduces eval.json.
+    model, _ = eval_decoder.load_model(run_dir / "final.pt", "cpu")
+    for k, v in model.encoder.note_model.state_dict().items():
+        assert torch.equal(v, kong[k]), k
+    assert not model.encoder.note_model.training
+    ev1 = json.loads((run_dir / "eval.json").read_text())
+    again = eval_decoder.run(run_dir, device="cpu", batch_size=4, log=quiet, decoding=["greedy"])
+    assert again["test"] == ev1["test"]
+
+    # --resume continues after the last epoch with Kong (and its BN stats) restored.
+    last1 = torch.load(run_dir / "last.pt", weights_only=False)
+    (run_dir / "eval.json").unlink()
+    run(parse_args(base + ["--epochs", "2", "--resume"]), log=quiet)
+    hist = json.loads((run_dir / "metrics.json").read_text())["history"]
+    assert [h["epoch"] for h in hist] == [1, 2]
+    assert hist[0] == last1["history"][0]
+    final2 = torch.load(run_dir / "final.pt", weights_only=False)
+    assert not torch.equal(final2["kong"]["bn0.running_mean"], kong["bn0.running_mean"])
 
 
 @pytest.mark.skipif(not (CHECKPOINT.is_file() and KONG_REPO.is_dir()),
