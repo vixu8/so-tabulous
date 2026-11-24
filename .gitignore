@@ -7,6 +7,10 @@ third_party/
 src/tabcnn/model/
 src/tabcnn/data/
 
+# synthtab development dataset
+src/data/synthtab-dev
+src/data/synthtab-dev-preprocessed
+
 # Python
 __pycache__/
 *.py[cod]
@@ -21,3 +25,12 @@ dist/
 
 # Training runs (checkpoints, metrics)
 runs/
+
+# SynthTab sharded-preprocessing scratch (generated per run / per environment)
+shards.tsv
+stage.log
+manifests/
+stats/
+
+# pytest --basetemp output (committed by accident in f87296f)
+.test-head-a-transfer-approved/

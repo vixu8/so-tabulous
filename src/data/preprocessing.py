@@ -58,7 +58,6 @@ from collections import Counter, defaultdict
 
 import h5py
 import librosa
-import mirdata
 import numpy as np
 
 SAMPLE_RATE = 16000                       # Kong's input sample rate
@@ -203,6 +202,8 @@ def main():
         parser.error("val_player and test_player must differ")
 
     # --- Stage 0: download only what we need ---
+    import mirdata  # GuitarSet-only dep; imported here so the SynthTab path
+                    # (which reuses this module's constants/helpers) doesn't need it.
     dataset = mirdata.initialize("guitarset", data_home=args.data_home)
     if not args.skip_download:
         dataset.download(partial_download=["annotations", "audio_mic"])
