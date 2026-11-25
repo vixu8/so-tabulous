@@ -84,7 +84,6 @@ DEFAULT_KONG_REPO = (Path(__file__).resolve().parents[1]
 
 
 # ----- splits -----
-
 def load_split(root, test_player):
     """Manifest rows per split, by player: {"train", "test"} -> DataFrame.
 
@@ -92,16 +91,27 @@ def load_split(root, test_player):
     player's clips are "test", the other 5 players' clips are "train".
     """
     manifest = pd.read_csv(Path(root) / "manifest.csv", dtype={"player_id": str})
+
+    # Fix Windows-style paths for Linux/macOS compatibility
+    manifest["hdf5_path"] = manifest["hdf5_path"].str.replace(
+        "\\", "/", regex=False
+    )
+
     test = str(test_player).zfill(2)
     players = set(manifest.player_id)
+
     if test not in players:
         raise ValueError(f"player {test!r} not in manifest (players: {sorted(players)})")
+
     splits = {
         "train": manifest[manifest.player_id != test],
         "test": manifest[manifest.player_id == test],
     }
+
     assert not set(splits["train"].player_id) & set(splits["test"].player_id), "player leak"
+
     return {k: df.reset_index(drop=True) for k, df in splits.items()}
+
 
 
 MANIFEST_COLUMNS = ("track_id", "hdf5_path")
