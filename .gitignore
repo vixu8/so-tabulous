@@ -10,6 +10,8 @@ src/tabcnn/data/
 # synthtab development dataset
 src/data/synthtab-dev
 src/data/synthtab-dev-preprocessed
+manifests
+manifest.csv
 
 # Python
 __pycache__/
