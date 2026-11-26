@@ -61,8 +61,14 @@ for the remaining epochs and (CUDA) peak GPU memory; every --log_every optimizer
 steps (default 50, 0 = off) a progress line inside the epoch gives running loss /
 token accuracy, steps/s and the time left in the epoch. <run_dir>/history.jsonl
 (one JSON line per finished epoch) is rewritten every epoch, so curves can be
-plotted while the run is going. <run_dir>/last.pt is saved every epoch, and
---resume continues from it (a finished run, one with eval.json, is skipped).
+plotted while the run is going. A checkpoint ckpt_e{E}_s{S}.pt is saved at the end
+of every epoch (and, with --ckpt_every N, every N optimizer steps inside an epoch
+too, so a multi-hour epoch survives a crash); each is a separate file holding the
+weights, the full resume state and the train + val metrics at that point (validation
+is run when a mid-epoch checkpoint is saved). --resume continues from the most
+advanced checkpoint, mid-epoch if that is where it stopped (a finished run, one with
+eval.json, is skipped). --max_val_clips caps the val set so per-epoch validation
+stays cheap on the full dataset.
 
 Random Kong (--kong_init random, the pretraining ablation): Kong is built without
 the MAESTRO checkpoint (KongEncoder.from_scratch: Kong's own init, and Kong's
@@ -71,13 +77,14 @@ together with a fresh decoder in ONE stage (--stage 1; --stage 2 raises), Kong i
 TunableKongEncoder's "scratch" mode: every Kong weight and BatchNorm trains, the
 STFT / log-mel frontend stays fixed. Same loss, optimizer and schedule as above,
 one AdamW group over Kong + decoder. Defaults: lr 3e-4, 75 epochs (= decoder1's
-50 + 25), --out_dir runs/<arch>_randkong, --tag scratch. final.pt / last.pt also
-store the trained Kong state ("kong"); eval_decoder rebuilds it from there.
+50 + 25), --out_dir runs/<arch>_randkong, --tag scratch. final.pt / the ckpt files
+also store the trained Kong state ("kong"); eval_decoder rebuilds it from there.
 The default --kong_init pretrained changes nothing above.
 
 Writes <out_dir>/<tag>_test{T}/ or <tag>_zeroshot/ (tag defaults to stage1 /
 stage2): final.pt (decoder [+ LoRA A/B] + model config + tokenizer config),
-last.pt, metrics.json, eval.json, test_notes_<decoding>.npz, train.log, history.jsonl.
+ckpt_e{E}_s{S}.pt (one per checkpoint), metrics.json, eval.json,
+test_notes_<decoding>.npz, train.log, history.jsonl.
 """
 
 from __future__ import annotations
@@ -85,6 +92,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 import time
 from collections import defaultdict
@@ -126,6 +134,25 @@ def stage1_dir(args):
     return Path(args.stage1_dir or Path(args.out_dir) / f"stage1_{run_suffix(args)}")
 
 
+def ckpt_path(run_dir, epoch, step_in_epoch):
+    """Per-checkpoint file. step_in_epoch == steps_per_epoch marks a finished epoch;
+    a smaller value is a mid-epoch checkpoint."""
+    return Path(run_dir) / f"ckpt_e{epoch:03d}_s{step_in_epoch:06d}.pt"
+
+
+def latest_checkpoint(run_dir):
+    """The most advanced ckpt_e{E}_s{S}.pt in run_dir (highest epoch, then step), or
+    None. Each checkpoint is its own file, so --resume picks the furthest one."""
+    best = None
+    for p in Path(run_dir).glob("ckpt_e*_s*.pt"):
+        m = re.fullmatch(r"ckpt_e(\d+)_s(\d+)\.pt", p.name)
+        if m:
+            key = (int(m.group(1)), int(m.group(2)))
+            if best is None or key > best[0]:
+                best = (key, p)
+    return best[1] if best else None
+
+
 def training_data(args):
     """(train rows, val rows or None, their root, test rows).
 
@@ -147,6 +174,11 @@ def training_data(args):
         raise ValueError(f"--data synthtab: {len(shared)} training clips are GuitarSet clips "
                          f"(e.g. {sorted(shared)[0]}); the SynthTab decoder must never see "
                          "GuitarSet")
+    # Cap the val set (the full val split is re-read every epoch; on the full SynthTab
+    # that is tens of GB for what is only a monitoring signal). A seeded sample is
+    # reproducible, so the same val clips are used across epochs and resumes.
+    if args.max_val_clips and len(val) > args.max_val_clips:
+        val = val.sample(n=args.max_val_clips, random_state=args.seed).reset_index(drop=True)
     return train, (val if len(val) else None), args.train_root, test
 
 
@@ -391,16 +423,38 @@ def run(args, log=None):
         f"trainable; peak lr {args.lr}, weight decay {args.weight_decay}, warmup "
         f"{args.warmup_epochs} epochs then cosine, {args.epochs} epochs (last one kept)")
 
-    history, start = [], 1
-    last_path = run_dir / "last.pt"
-    if args.resume and last_path.exists():
-        last = torch.load(last_path, map_location="cpu", weights_only=False)
+    def save_ckpt(epoch, step_in_epoch, history, metrics):
+        """Write a standalone checkpoint ckpt_e{E}_s{S}.pt: the weights at this point,
+        the full resume state (optimizer / scheduler / RNG / history) and the train +
+        val metrics measured here. Separate files, never overwritten, so the whole
+        trajectory through a long epoch is kept; --resume picks the most advanced one."""
+        path = ckpt_path(run_dir, epoch, step_in_epoch)
+        torch.save({"epoch": epoch, "step_in_epoch": step_in_epoch,
+                    "state": snapshot(model, args.kong_init), "optimizer": opt.state_dict(),
+                    "scheduler": sched.state_dict(), "torch_rng": torch.get_rng_state(),
+                    "history": history, "metrics": metrics}, path)
+        return path
+
+    history, start, resume_step = [], 1, 0
+    resume_from = latest_checkpoint(run_dir) if args.resume else None
+    if resume_from is not None:
+        last = torch.load(resume_from, map_location="cpu", weights_only=False)
         restore(model, last["state"])
         opt.load_state_dict(last["optimizer"])
         sched.load_state_dict(last["scheduler"])
         torch.set_rng_state(last["torch_rng"])
-        history, start = last["history"], last["epoch"] + 1
-        log(f"resumed after epoch {last['epoch']}")
+        history = last["history"]
+        done_in_epoch = last.get("step_in_epoch", steps_per_epoch)
+        if done_in_epoch >= steps_per_epoch:
+            start = last["epoch"] + 1
+            log(f"resumed from {resume_from.name} after epoch {last['epoch']}")
+        else:
+            # Mid-epoch: optimizer/scheduler/model are already at this step; redo the
+            # epoch's remaining steps only. The data loader restarts (fresh random
+            # crops), which is fine -- crops are sampled anew every epoch anyway.
+            start, resume_step = last["epoch"], done_in_epoch
+            log(f"resumed from {resume_from.name} mid-epoch {last['epoch']} after "
+                f"{done_in_epoch}/{steps_per_epoch} steps")
 
     t_train = time.time()
     for epoch in range(start, args.epochs + 1):
@@ -409,7 +463,11 @@ def run(args, log=None):
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         sums, steps = defaultdict(float), 0
+        done = resume_step if epoch == start else 0     # optimizer steps already done this epoch
+        resume_step = 0
         for group in groups_of(loader, args.grad_accum):
+            if done >= steps_per_epoch:                 # resumed epoch: stop at the tail
+                break
             loss, accuracy, grad_norm, truncated = train_step(model, group, opt, params, args,
                                                               device)
             sched.step()
@@ -418,13 +476,27 @@ def run(args, log=None):
             sums["grad_norm"] += grad_norm
             sums["truncated"] += truncated
             steps += 1
-            if args.log_every and steps % args.log_every == 0 and steps < steps_per_epoch:
+            done += 1
+            if args.log_every and steps % args.log_every == 0 and done < steps_per_epoch:
                 elapsed = time.time() - t0
-                log(f"  epoch {epoch} step {steps}/{steps_per_epoch} | loss "
+                log(f"  epoch {epoch} step {done}/{steps_per_epoch} | loss "
                     f"{sums['loss'] / steps:.4f} | token acc {sums['accuracy'] / steps:.3f} | "
                     f"lr {sched.get_last_lr()[0]:.2e} | {steps / elapsed:.2f} steps/s | "
-                    f"{fmt_time(elapsed)}, ~{fmt_time(elapsed / steps * (steps_per_epoch - steps))}"
+                    f"{fmt_time(elapsed)}, ~{fmt_time(elapsed / steps * (steps_per_epoch - done))}"
                     " left in epoch")
+            if args.ckpt_every and done % args.ckpt_every == 0 and done < steps_per_epoch:
+                # Validate at the checkpoint so its saved metrics reflect this moment,
+                # not the previous epoch end. validate() restores train mode after.
+                val_mid = validate(model, val_loader, args, device)
+                metrics = {"epoch": epoch, "step_in_epoch": done,
+                           "train_running": {"loss": sums["loss"] / steps,
+                                             "accuracy": sums["accuracy"] / steps}}
+                if val_mid is not None:
+                    metrics["val"] = val_mid
+                path = save_ckpt(epoch, done, history, metrics)
+                log(f"  checkpoint: epoch {epoch} step {done}/{steps_per_epoch} -> {path.name}"
+                    + (f" | val loss {val_mid['loss']:.4f} | val acc {val_mid['accuracy']:.3f}"
+                       if val_mid else ""))
         train = {k: v / max(steps, 1) for k, v in sums.items() if k != "truncated"}
         train["truncated_sequences"] = int(sums["truncated"])
         seconds = time.time() - t0
@@ -448,9 +520,7 @@ def run(args, log=None):
             + (f" | peak mem {record['peak_mem_gb']:.1f} GB" if "peak_mem_gb" in record else "")
             + (f" | {train['truncated_sequences']} truncated" if train["truncated_sequences"] else ""))
         write_history(run_dir, history)
-        torch.save({"epoch": epoch, "state": snapshot(model, args.kong_init), "optimizer": opt.state_dict(),
-                    "scheduler": sched.state_dict(), "torch_rng": torch.get_rng_state(),
-                    "history": history}, last_path)
+        save_ckpt(epoch, steps_per_epoch, history, record)
     if start <= args.epochs:
         log(f"training done: {args.epochs - start + 1} epochs in {fmt_time(time.time() - t_train)}")
     t_eval = time.time()
@@ -526,13 +596,24 @@ def parse_args(argv=None):
     p.add_argument("--crops_per_clip", type=int, default=2, help="random 10 s crops per clip per epoch")
     p.add_argument("--log_every", type=int, default=50,
                    help="progress line every N optimizer steps inside an epoch (0 = off)")
+    p.add_argument("--ckpt_every", type=int, default=0,
+                   help="also checkpoint every N optimizer steps inside an epoch (0 = only at "
+                        "epoch end), so a long epoch survives a crash. Each checkpoint is a "
+                        "separate ckpt_e{E}_s{S}.pt (weights + resume state + metrics, with "
+                        "validation run at that point); --resume continues from the most "
+                        "advanced one")
+    p.add_argument("--max_val_clips", type=int, default=0,
+                   help="cap the SynthTab val set to this many clips (0 = all). The val split "
+                        "is re-read every epoch, so a cap keeps per-epoch validation cheap on "
+                        "the full dataset; a seeded sample keeps it the same across epochs")
     p.add_argument("--decode_batch", type=int, default=16, help="test windows decoded at once")
     ev.add_decoding_args(p)
     p.add_argument("--amp", action="store_true", help="bf16 autocast (CUDA only)")
     p.add_argument("--num_workers", type=int, default=4, help="DataLoader workers")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="auto", help="auto, cuda, mps or cpu")
-    p.add_argument("--resume", action="store_true", help="continue from <run_dir>/last.pt")
+    p.add_argument("--resume", action="store_true",
+                   help="continue from the most advanced <run_dir>/ckpt_e{E}_s{S}.pt")
     args = p.parse_args(argv)
     args.test_player = args.test_player.zfill(2)
     if args.kong_init == "random":

@@ -32,13 +32,25 @@ def main():
     csvs = sorted(glob.glob(os.path.join(args.manifests_dir, "*.csv")))
     if not csvs:
         raise SystemExit(f"no CSVs in {args.manifests_dir}")
-    frames = [pd.read_csv(c, dtype={"track_id": str}) for c in csvs]
+    frames = []
+    for c in csvs:
+        df = pd.read_csv(c, dtype={"track_id": str})
+        df["_shard"] = os.path.basename(c)          # remember each row's source manifest
+        frames.append(df)
     m = pd.concat(frames, ignore_index=True)
 
-    dup = int(m.track_id.duplicated().sum())
-    if dup:
-        raise SystemExit(f"{dup} duplicate track_ids across shards (unexpected -- "
-                         "track_id should be globally unique)")
+    dup_mask = m.track_id.duplicated(keep=False)
+    if dup_mask.any():
+        dup_ids = m.loc[dup_mask, "track_id"].drop_duplicates()
+        print(f"{len(dup_ids)} track_ids are duplicated across shards; first few and the "
+              "shards they appear in:")
+        for tid in dup_ids.head(5):
+            shards = sorted(m.loc[m.track_id == tid, "_shard"])
+            print(f"  {tid}: {shards}")
+        raise SystemExit(f"{len(dup_ids)} duplicate track_ids across shards (unexpected -- "
+                         "track_id should be globally unique; likely two shards' --filter "
+                         "regexes overlapped and preprocessed the same clips)")
+    m = m.drop(columns="_shard")
     # No Guitar Pro file may span splits (same check the preprocessor runs per shard).
     import re
 

@@ -18,7 +18,8 @@ import torch
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC / "decoder"))
 import eval_decoder  # noqa: E402
-from train_decoder import lr_lambda, parse_args, run, train_step, training_data  # noqa: E402
+from train_decoder import (latest_checkpoint, lr_lambda, parse_args, run,  # noqa: E402
+                           train_step, training_data)
 from loader import collate  # noqa: E402
 from tab_decoder import KongTabDecoder  # noqa: E402
 from tokenizer import TabTokenizer  # noqa: E402
@@ -226,7 +227,7 @@ def test_stage1_then_stage2_end_to_end_and_resume(tmp_path):
         assert {"pitch", "tab", "tdr"} <= set(ev1["test"][name]["frame"])
         with np.load(s1 / f"test_notes_{name}.npz") as z:     # test player only
             assert set(z.files) == {"05_Test0-100-C_comp__est", "05_Test0-100-C_comp__ref"}
-    last1 = torch.load(s1 / "last.pt", weights_only=False)
+    last1 = torch.load(latest_checkpoint(s1), weights_only=False)
     assert not last1["state"]["lora"]
     # The final model is the last epoch, and the decoder trained (its output layer starts at zero).
     assert torch.equal(last1["state"]["decoder"]["out.weight"], final1["decoder"]["out.weight"])
@@ -246,7 +247,7 @@ def test_stage1_then_stage2_end_to_end_and_resume(tmp_path):
     final = torch.load(run_dir / "final.pt", weights_only=False)
     assert final["stage"] == 2 and final["lora"] and final["lora_config"] == {"rank": 8, "alpha": 16.0}
     assert final["config"] == final1["config"]
-    last = torch.load(run_dir / "last.pt", weights_only=False)
+    last = torch.load(latest_checkpoint(run_dir), weights_only=False)
     trained_b = [v for k, v in last["state"]["lora"].items() if k.endswith(".B")]
     assert any(v.abs().sum() > 0 for v in trained_b)          # LoRA actually trained
     assert (run_dir / "eval.json").exists() and (run_dir / "test_notes_beam4.npz").exists()
@@ -305,7 +306,7 @@ def test_random_kong_one_stage_end_to_end_reload_and_resume(tmp_path):
     assert again["test"] == ev1["test"]
 
     # --resume continues after the last epoch with Kong (and its BN stats) restored.
-    last1 = torch.load(run_dir / "last.pt", weights_only=False)
+    last1 = torch.load(latest_checkpoint(run_dir), weights_only=False)
     (run_dir / "eval.json").unlink()
     run(parse_args(base + ["--epochs", "2", "--resume"]), log=quiet)
     hist = json.loads((run_dir / "metrics.json").read_text())["history"]

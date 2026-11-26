@@ -253,12 +253,25 @@ class GuitarSetDataset(torch.utils.data.Dataset):
 
         rows = pd.DataFrame(rows)
         self.clips = []  # (track_id, hdf5 path, n_samples)
-        for track_id, rel in zip(rows.track_id, rows.hdf5_path):
+        # n_samples only drives window enumeration and the random-crop start range;
+        # it never changes the audio actually read (_load slices + zero-pads from the
+        # file and derives n_valid_frames from the real samples). The manifest's
+        # `duration` is len(waveform)/SAMPLE_RATE at preprocess time, so
+        # round(duration * SAMPLE_RATE) recovers n_samples exactly -- use it to avoid
+        # opening every HDF5 here (prohibitive on the full SynthTab's millions of
+        # files). Fall back to reading the file when duration is absent (e.g. a
+        # GuitarSet manifest without the column) or non-positive.
+        durations = rows["duration"].tolist() if "duration" in rows.columns else None
+        for i, (track_id, rel) in enumerate(zip(rows.track_id, rows.hdf5_path)):
             # Accept manifests written on either OS: a Windows-built manifest stores
             # hdf5_path with "\", which is a literal char (not a separator) on Linux.
             path = self.root / str(rel).replace("\\", "/")
-            with h5py.File(path, "r") as hf:
-                n = int(hf["waveform"].shape[0])
+            dur = durations[i] if durations is not None else None
+            if dur is not None and pd.notna(dur) and dur > 0:
+                n = int(round(float(dur) * SAMPLE_RATE))
+            else:
+                with h5py.File(path, "r") as hf:
+                    n = int(hf["waveform"].shape[0])
             self.clips.append((str(track_id), path, n))
 
         # windows mode: (clip index, start sample) for every window
