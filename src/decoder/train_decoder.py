@@ -68,7 +68,8 @@ weights, the full resume state and the train + val metrics at that point (valida
 is run when a mid-epoch checkpoint is saved). --resume continues from the most
 advanced checkpoint, mid-epoch if that is where it stopped (a finished run, one with
 eval.json, is skipped). --max_val_clips caps the val set so per-epoch validation
-stays cheap on the full dataset.
+stays cheap on the full dataset. --s3_checkpoints s3://bucket/prefix uploads each
+checkpoint (and the final artifacts) to S3 as it is written, for a durable backup.
 
 Random Kong (--kong_init random, the pretraining ablation): Kong is built without
 the MAESTRO checkpoint (KongEncoder.from_scratch: Kong's own init, and Kong's
@@ -93,6 +94,7 @@ import argparse
 import json
 import math
 import re
+import subprocess
 import sys
 import time
 from collections import defaultdict
@@ -423,16 +425,32 @@ def run(args, log=None):
         f"trainable; peak lr {args.lr}, weight decay {args.weight_decay}, warmup "
         f"{args.warmup_epochs} epochs then cosine, {args.epochs} epochs (last one kept)")
 
+    def push_s3(path):
+        """Best-effort upload of one file to --s3_checkpoints via the aws CLI. A failed
+        upload warns but never aborts training (a network blip shouldn't kill a run)."""
+        if not args.s3_checkpoints:
+            return
+        dest = args.s3_checkpoints.rstrip("/") + "/" + Path(path).name
+        try:
+            subprocess.run(["aws", "s3", "cp", str(path), dest],
+                           check=True, capture_output=True, text=True)
+            log(f"  uploaded {Path(path).name} -> {dest}")
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            err = e.stderr if isinstance(e, subprocess.CalledProcessError) else str(e)
+            log(f"  WARNING: S3 upload of {Path(path).name} failed: {(err or '').strip()}")
+
     def save_ckpt(epoch, step_in_epoch, history, metrics):
         """Write a standalone checkpoint ckpt_e{E}_s{S}.pt: the weights at this point,
         the full resume state (optimizer / scheduler / RNG / history) and the train +
         val metrics measured here. Separate files, never overwritten, so the whole
-        trajectory through a long epoch is kept; --resume picks the most advanced one."""
+        trajectory through a long epoch is kept; --resume picks the most advanced one.
+        Uploaded to --s3_checkpoints as soon as it is written, if that is set."""
         path = ckpt_path(run_dir, epoch, step_in_epoch)
         torch.save({"epoch": epoch, "step_in_epoch": step_in_epoch,
                     "state": snapshot(model, args.kong_init), "optimizer": opt.state_dict(),
                     "scheduler": sched.state_dict(), "torch_rng": torch.get_rng_state(),
                     "history": history, "metrics": metrics}, path)
+        push_s3(path)
         return path
 
     history, start, resume_step = [], 1, 0
@@ -525,6 +543,9 @@ def run(args, log=None):
         log(f"training done: {args.epochs - start + 1} epochs in {fmt_time(time.time() - t_train)}")
     t_eval = time.time()
     result = finish(args, model, run_dir, history, device, log)
+    for name in ("final.pt", "metrics.json", "eval.json"):
+        if (run_dir / name).exists():
+            push_s3(run_dir / name)
     log(f"eval took {fmt_time(time.time() - t_eval)}; run total {fmt_time(time.time() - t_start)} "
         f"(finished {time.strftime('%Y-%m-%d %H:%M:%S')})")
     return result
@@ -606,6 +627,11 @@ def parse_args(argv=None):
                    help="cap the SynthTab val set to this many clips (0 = all). The val split "
                         "is re-read every epoch, so a cap keeps per-epoch validation cheap on "
                         "the full dataset; a seeded sample keeps it the same across epochs")
+    p.add_argument("--s3_checkpoints", metavar="S3_URI", default=None,
+                   help="if set (e.g. s3://bucket/prefix), upload each checkpoint the moment "
+                        "it is written -- plus final.pt / metrics.json / eval.json at the end -- "
+                        "to this S3 prefix via the aws CLI. Upload failures warn but do not stop "
+                        "training; durable backup for a spot/instance-store box")
     p.add_argument("--decode_batch", type=int, default=16, help="test windows decoded at once")
     ev.add_decoding_args(p)
     p.add_argument("--amp", action="store_true", help="bf16 autocast (CUDA only)")

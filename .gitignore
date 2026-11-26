@@ -11,6 +11,7 @@ src/tabcnn/data/
 src/data/synthtab-dev
 src/data/synthtab-dev-preprocessed
 manifests
+manifest.csv
 
 # Python
 __pycache__/
