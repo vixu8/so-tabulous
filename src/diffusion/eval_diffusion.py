@@ -50,6 +50,8 @@ def load_model(path, device, checkpoint=None, kong_repo=None):
                                                  repo_path=kong_repo or args["kong_repo"],
                                                  use_adapter=args["use_adapter"])
     model = KongTabDiffusion(encoder, saved["timesteps"], saved["schedule"], **saved["config"])
+    if args.get("stage", 1) == 2:
+        encoder.set_finetune("lora", rank=args["rank"], alpha=args["alpha"])
     restore(model, saved["state"])
     return model.to(device).eval(), saved
 

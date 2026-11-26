@@ -91,6 +91,43 @@ crops per clip per epoch. BF16 is enabled when the CUDA device supports it;
 frozen; leave it off for the current AR baseline's encoder configuration.
 Architecture and loss settings are exposed in `--help`.
 
+### Stage 2: adapt Kong with LoRA
+
+Stage 1 remains the default (`--stage 1`): train the denoiser with frozen Kong.
+Stage 2 loads stage 1's `final.pt`, continues training the full denoiser (and
+fusion adapter if enabled), and trains only LoRA weights in Kong. Defaults:
+25 additional epochs, LR 1e-4, rank 8, alpha 16. Override these with `--epochs`,
+`--lr`, `--rank`, and `--alpha`. Kong's original weights and BatchNorm statistics
+stay fixed. Use the same pretrained Kong checkpoint/source and GuitarSet root.
+
+```bash
+python src/diffusion/train_diffusion.py --stage 1 --test_player 05 --device cuda --amp
+python src/diffusion/train_diffusion.py --stage 2 --test_player 05 --device cuda --amp
+python src/diffusion/eval_diffusion.py --run_dir runs/diffusion/stage2_test05
+python src/diffusion/summarize_diffusion.py --tag stage2 --folds 05
+```
+
+Stage 2 reads `runs/diffusion/stage1_test<player>/final.pt` by default;
+`--stage1_dir <directory>` selects a custom run. The held-out player must match.
+The denoiser architecture, adapter setting, diffusion schedule and timestep
+count are inherited automatically. Outputs default to
+`runs/diffusion/stage2_test<player>/`. Both `last.pt` and `final.pt` include
+LoRA A/B weights; standalone evaluation restores them automatically. Older
+stage 1 checkpoints remain loadable.
+
+Resume stage 2 with the same command plus `--resume`. It restores its own
+checkpoint without needing the original stage 1 directory. Feature caching
+is forbidden in stage 2 because Kong's features change during training.
+
+Run both stages sequentially for all six folds:
+
+```bash
+python scripts/run_folds.py \
+  --cmd "python src/diffusion/train_diffusion.py --stage 1 --test_player {test} --device cuda --amp" \
+  --cmd "python src/diffusion/train_diffusion.py --stage 2 --test_player {test} --device cuda --amp"
+python src/diffusion/summarize_diffusion.py --tag stage2 --folds 00 01 02 03 04 05
+```
+
 Splits are the loader's current convention: five training players, one test
 player, **no validation player**. Keep the last fixed epoch; do not tune epochs,
 thresholds, sampling temperature, or step counts on the test player. Defaults
@@ -117,7 +154,7 @@ when all encoder outputs are frozen, and rejects a trainable fusion adapter.
 Random crops usually have few hits; explicitly choose `--crop_mode windows` to
 reuse aligned fixed windows across epochs. The same loader still constructs
 the matching tab/onset targets. No cached features are used with LoRA or any
-trainable encoder. LoRA stage 2, SynthTab, and full D3RM diffusion are deferred.
+trainable encoder. SynthTab and full D3RM diffusion are deferred.
 
 ## Sanity checks
 

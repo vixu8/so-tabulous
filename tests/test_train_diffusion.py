@@ -121,6 +121,81 @@ def test_real_kong_frozen_training_and_generation():
     assert int(output["tab"].max()) <= 20
 
 
+class TinyTunableEncoder(FakeEncoder):
+    """Exercise the shared LoRA parametrizations through the real trainer."""
+    def set_finetune(self, mode, rank=8, alpha=16):
+        from lora import add_lora, lora_parameters
+        self.note_model.requires_grad_(False)
+        if mode == "lora":
+            add_lora(self.note_model, rank=rank, alpha=alpha)
+            for parameter in lora_parameters(self.note_model):
+                parameter.requires_grad_(True)
+
+
+def test_stage2_transfer_lora_resume_and_eval(tmp_path, monkeypatch):
+    root = write_dataset(tmp_path / "data")
+    def encoder_factory(*args, **kwargs):
+        # Repeated loads represent the same external pretrained checkpoint.
+        with torch.random.fork_rng():
+            torch.manual_seed(42)
+            return TinyTunableEncoder(frames=1001)
+    monkeypatch.setattr(tr.TunableKongEncoder, "from_checkpoint", encoder_factory)
+    output = tmp_path / "runs"
+    tr.run(arguments(root, output, "--skip_eval"))
+    source = output / "stage1_test05/final.pt"
+    stage1 = torch.load(source, weights_only=False)
+    actual_step = tr.train_step
+    calls = []
+    def inspect_then_interrupt(model, *args, **kwargs):
+        if not calls:
+            for key, value in model.denoiser.state_dict().items():
+                torch.testing.assert_close(value, stage1["state"]["denoiser"][key], rtol=0, atol=0)
+            assert model.encoder.note_model.parametrizations.weight.original.requires_grad is False
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("stage2 interruption")
+        return actual_step(model, *args, **kwargs)
+    monkeypatch.setattr(tr, "train_step", inspect_then_interrupt)
+    args = arguments(root, output, "--stage", "2", "--skip_eval", "--rank", "2")
+    with pytest.raises(RuntimeError, match="stage2 interruption"):
+        tr.run(args)
+    monkeypatch.setattr(tr, "train_step", actual_step)
+    # Resuming uses stage 2's own state, even after stage 1 is archived.
+    source.rename(source.with_suffix(".archived"))
+    args.resume = True
+    resumed_history = tr.run(args)
+    directory = output / "stage2_test05"
+    saved = torch.load(directory / "final.pt", weights_only=False)
+    assert saved["args"]["lr"] == 1e-4
+    assert any(value.abs().sum() > 0 for key, value in saved["state"]["lora"].items() if key.endswith(".B"))
+    # Compare against an uninterrupted stage 2 starting from the same stage 1.
+    source.with_suffix(".archived").rename(source)
+    full = arguments(root, tmp_path / "full", "--stage", "2", "--skip_eval", "--rank", "2",
+                     "--stage1_dir", str(source.parent))
+    full_history = tr.run(full)
+    assert resumed_history[-1]["train"]["loss"] == full_history[-1]["train"]["loss"]
+    full_state = torch.load(tmp_path / "full/stage2_test05/final.pt", weights_only=False)["state"]
+    for section in ("denoiser", "lora"):
+        for key, value in saved["state"][section].items():
+            torch.testing.assert_close(value, full_state[section][key], rtol=0, atol=0)
+    model, _ = ev.load_model(directory / "final.pt", torch.device("cpu"))
+    for key, value in tr.snapshot(model)["lora"].items():
+        torch.testing.assert_close(value, saved["state"]["lora"][key], rtol=0, atol=0)
+    result = ev.evaluate(model, directory, vars(args), torch.device("cpu"))
+    assert set(result["test"]) == {"one_pass", "diffusion1", "diffusion2"}
+
+
+def test_stage2_rejects_cache_and_wrong_fold(tmp_path, monkeypatch):
+    with pytest.raises(SystemExit):
+        tr.parse_args(["--stage", "2", "--feature_cache", str(tmp_path)])
+    root = write_dataset(tmp_path / "data")
+    monkeypatch.setattr(tr, "build_model", fake_build)
+    tr.run(arguments(root, tmp_path, "--skip_eval"))
+    with pytest.raises(ValueError, match="same test player"):
+        tr.run(arguments(root, tmp_path, "--stage", "2", "--test_player", "00",
+                         "--stage1_dir", str(tmp_path / "stage1_test05")))
+
+
 def test_summary_fold_statistics_and_settings_consistency(tmp_path):
     from summarize_diffusion import summarize
     for player, value in [("00", 0.4), ("01", 0.6)]:

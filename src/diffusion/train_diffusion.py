@@ -1,4 +1,4 @@
-"""Train one frozen-Kong GuitarSet diffusion fold; last epoch, no test selection.
+"""Train a GuitarSet diffusion fold: frozen Kong (stage 1), then LoRA (stage 2).
 
 python src/diffusion/train_diffusion.py --test_player 05 --amp
 Use --resume for epoch-boundary recovery with optimizer, schedule and RNG state.
@@ -23,7 +23,7 @@ for sub in (HERE, HERE.parent / "data", HERE.parent / "kong_wrapper"):
     if str(sub) not in sys.path:
         sys.path.insert(0, str(sub))
 from loader import GuitarSetDataset, collate, load_split  # noqa: E402
-from lora import TunableKongEncoder  # noqa: E402
+from lora import TunableKongEncoder, lora_state_dict, load_lora_state_dict  # noqa: E402
 from kong_tab_diffusion import KongTabDiffusion  # noqa: E402
 
 
@@ -48,11 +48,14 @@ def seed_worker(worker_id):
 def build_model(args, device):
     encoder = TunableKongEncoder.from_checkpoint(args.checkpoint, repo_path=args.kong_repo,
                                                  use_adapter=args.use_adapter)
-    return KongTabDiffusion(encoder, timesteps=args.timesteps, schedule=args.schedule,
+    model = KongTabDiffusion(encoder, timesteps=args.timesteps, schedule=args.schedule,
                            hidden_dim=args.hidden_dim, embed_dim=args.embed_dim,
                            lstm_hidden=args.lstm_hidden, heads=args.heads,
                            window=args.window, dilations=args.dilations, d_ff=args.d_ff,
                            dropout=args.dropout).to(device)
+    if getattr(args, "stage", 1) == 2:
+        encoder.set_finetune("lora", rank=args.rank, alpha=args.alpha)
+    return model
 
 
 def snapshot(model):
@@ -60,10 +63,13 @@ def snapshot(model):
         return {k: v.detach().cpu().clone() for k, v in module.state_dict().items()}
     adapter = getattr(model.encoder, "fusion_adapter", None)
     return {"denoiser": cpu(model.denoiser), "diffusion": cpu(model.diffusion),
-            "adapter": cpu(adapter) if adapter is not None else None}
+            "adapter": cpu(adapter) if adapter is not None else None,
+            "lora": lora_state_dict(model.encoder.note_model)}
 
 
 def restore(model, state):
+    if state.get("lora"):
+        load_lora_state_dict(model.encoder.note_model, state["lora"])
     model.denoiser.load_state_dict(state["denoiser"])
     model.diffusion.load_state_dict(state["diffusion"])
     adapter = getattr(model.encoder, "fusion_adapter", None)
@@ -181,6 +187,22 @@ def run(args):
             stream.write(message + "\n")
     if (run_dir / "last.pt").exists() and not args.resume:
         raise FileExistsError(f"{run_dir} already has a checkpoint; use --resume or a new --tag")
+    initial = None
+    if args.stage == 2:
+        # A resumed stage 2 is self-contained apart from the pretrained Kong.
+        source = (run_dir / "last.pt" if args.resume else
+                  Path(args.stage1_dir or Path(args.out_dir) / f"stage1_test{args.test_player}") / "final.pt")
+        initial = torch.load(source, map_location="cpu", weights_only=False)
+        previous = initial["args"]
+        if not args.resume and (previous.get("stage", 1) != 1 or
+                                previous["test_player"] != args.test_player):
+            raise ValueError("stage 2 requires a stage 1 checkpoint for the same test player")
+        # Reconstruct the trained architecture and its exact corruption process.
+        for key in ("hidden_dim", "embed_dim", "lstm_hidden", "heads", "window", "d_ff",
+                    "dilations", "dropout", "timesteps", "schedule", "use_adapter"):
+            setattr(args, key, previous[key])
+        if not args.skip_eval and any(s < 1 or s > args.timesteps for s in args.inference_steps):
+            raise ValueError("inference_steps must lie in the stage 1 model's 1..timesteps")
     config = vars(args).copy()
     splits = load_split(args.root, args.test_player)
     if len(splits["train"]) == 0:
@@ -192,6 +214,8 @@ def run(args):
                         num_workers=args.num_workers, worker_init_fn=seed_worker,
                         generator=generator, pin_memory=device.type == "cuda")
     model = build_model(args, device)
+    if initial is not None and not args.resume:
+        restore(model, initial["state"])
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW([
         {"params": [p for p in params if p.ndim >= 2], "weight_decay": args.weight_decay},
@@ -202,7 +226,9 @@ def run(args):
     if args.resume:
         saved = torch.load(run_dir / "last.pt", map_location="cpu", weights_only=False)
         operational = {"resume", "device", "log_every", "skip_eval", "inference_steps", "decode_batch"}
-        changed = [k for k, v in config.items() if k not in operational and saved["args"].get(k) != v]
+        legacy_defaults = {"stage": 1, "stage1_dir": None, "rank": 8, "alpha": 16.0}
+        changed = [k for k, v in config.items() if k not in operational and
+                   saved["args"].get(k, legacy_defaults.get(k)) != v]
         if changed:
             raise ValueError(f"resume requires the same training configuration: changed {changed}")
         restore(model, saved["state"])
@@ -214,7 +240,7 @@ def run(args):
     counts = {"total": sum(p.numel() for p in model.parameters()),
               "trainable": sum(p.numel() for p in params),
               "denoiser": sum(p.numel() for p in model.denoiser.parameters())}
-    log(f"device {device}; parameters {counts}; {len(dataset)} training crops/windows; "
+    log(f"stage {args.stage}; device {device}; parameters {counts}; {len(dataset)} training crops/windows; "
         f"train players {sorted(set(splits['train'].player_id))}; test {args.test_player}")
     for epoch in range(first_epoch, args.epochs + 1):
         model.train()
@@ -261,18 +287,22 @@ def run(args):
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--stage", type=int, choices=(1, 2), default=1)
+    p.add_argument("--stage1_dir", default=None, help="stage 2: directory containing stage 1 final.pt")
+    p.add_argument("--rank", type=int, default=8, help="stage 2: Kong LoRA rank")
+    p.add_argument("--alpha", type=float, default=16.0, help="stage 2: Kong LoRA alpha")
     p.add_argument("--root", default=str(REPO / "features" / "v1"))
     p.add_argument("--checkpoint", default=str(REPO / "src/kong_wrapper/checkpoints/kong_note_pedal.pth"))
     p.add_argument("--kong_repo", default=str(REPO / "src/kong_wrapper/third_party/piano_transcription"))
     p.add_argument("--test_player", default="05")
     p.add_argument("--out_dir", default=str(REPO / "runs/diffusion"))
-    p.add_argument("--tag", default="stage1")
+    p.add_argument("--tag", default=None, help="run prefix (default stage1 / stage2)")
     for name, default in {"batch_size": 8, "epochs": 25, "num_workers": 4, "seed": 0,
                           "timesteps": 100, "hidden_dim": 64, "embed_dim": 16,
                           "lstm_hidden": 32, "heads": 4, "window": 5, "d_ff": 256,
                           "crops_per_clip": 2, "log_every": 50, "decode_batch": 8}.items():
         p.add_argument(f"--{name}", type=int, default=default)
-    for name, default in {"lr": 3e-4, "weight_decay": 0.01, "grad_clip": 1.0,
+    for name, default in {"lr": None, "weight_decay": 0.01, "grad_clip": 1.0,
                           "warmup_epochs": 2.0, "dropout": 0.1, "lambda_onset": 0.5,
                           "masked_weight": 1.0, "unmasked_weight": 1.0,
                           "onset_pos_weight": 1.0, "onset_threshold": 0.5,
@@ -289,6 +319,8 @@ def parse_args(argv=None):
     for name in ("use_adapter", "resume", "skip_eval"):
         p.add_argument(f"--{name}", action="store_true")
     args = p.parse_args(argv)
+    args.tag = args.tag or f"stage{args.stage}"
+    args.lr = args.lr if args.lr is not None else (3e-4 if args.stage == 1 else 1e-4)
     args.test_player = args.test_player.zfill(2)
     positive = ("batch_size", "epochs", "timesteps", "crops_per_clip", "decode_batch",
                 "hidden_dim", "embed_dim", "lstm_hidden", "heads", "window", "d_ff")
@@ -296,6 +328,10 @@ def parse_args(argv=None):
         p.error("invalid training dimensions/counts")
     if args.use_adapter and args.feature_cache:
         p.error("cannot cache final Kong features while training the fusion adapter")
+    if args.stage == 2 and args.feature_cache:
+        p.error("cannot cache features while training Kong LoRA in stage 2")
+    if args.rank < 1 or not math.isfinite(args.alpha) or args.alpha <= 0:
+        p.error("LoRA rank and alpha must be positive")
     if not 0 <= args.onset_threshold <= 1 or args.temperature <= 0:
         p.error("invalid onset threshold or sampling temperature")
     if min(args.lambda_onset, args.masked_weight, args.unmasked_weight, args.weight_decay,
